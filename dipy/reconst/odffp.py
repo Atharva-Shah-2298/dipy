@@ -186,7 +186,8 @@ class OdffpDictionary(DiffusionDataGenerator):
 
     PREDEFINED_IDX_NUM = len((IDX_VOID, IDX_ISO))
 
-    def __init__(self, gtab, dict_file=None, is_sorted=False, tessellation=dsiSphere8Fold()):
+    def __init__(self, gtab, dict_file=None, is_sorted=False,
+                 tessellation=dsiSphere8Fold()):
 
         super().__init__(gtab, tessellation)
         self._is_sorted = is_sorted
@@ -377,7 +378,8 @@ class OdffpDictionary(DiffusionDataGenerator):
                     replace=False
                 )
 
-                # Store spherical coordinates of the directions in the Matlab format (azim,elev)
+                # Store spherical coordinates of the directions in
+                # the Matlab format (azim,elev)
                 # for backward compatibility
                 self.peak_dirs[:, :self.peaks_per_voxel[j], j] = np.array([
                     self.tessellation.phi[peak_dirs_idx[:self.peaks_per_voxel[j], i]],
@@ -386,18 +388,22 @@ class OdffpDictionary(DiffusionDataGenerator):
                 ])  # End of peak directions assignment
 
                 # Draw fraction volumes randomly
-                self.ratio[:self.peaks_per_voxel[j]+1, j] = self._random_fraction_volumes(
+                self.ratio[:self.peaks_per_voxel[j]+1, j] = \
+                    self._random_fraction_volumes(
                     p_iso, p_fib, self.peaks_per_voxel[j])
 
                 # Draw microstructure parameters randomly
-                self.micro[:, :self.peaks_per_voxel[j]+1, j] = self._random_micro_parameters(
+                self.micro[:, :self.peaks_per_voxel[j]+1, j] = \
+                    self._random_micro_parameters(
                     f_in, D_iso, D_a, D_e, D_r, self.peaks_per_voxel[j],
                     equal_fibers, assert_faster_D_a, tortuosity_approximation
                 )
 
             self.odf[:, chunk_idx] = self._compute_odf_trace(
                 odf_recon_model, self.ratio[:,
-                                            chunk_idx], self.micro[:, :, chunk_idx], peak_dirs_idx
+                                            chunk_idx],
+                                            self.micro[:, :, chunk_idx],
+                                            peak_dirs_idx
             )
 
             recompute_filter = np.zeros(chunk_size, dtype=bool)
@@ -411,7 +417,8 @@ class OdffpDictionary(DiffusionDataGenerator):
                 sorted_idx = np.argsort(
                     -self.odf[peak_dirs_idx[:self.peaks_per_voxel[j], i], j])
 
-                # If peaks were not sorted, reorder the microstructure parameters
+                # If peaks were not sorted,
+                # reorder the microstructure parameters
                 seq_idx = np.arange(self.peaks_per_voxel[j])
                 if np.any(sorted_idx != seq_idx):
                     self.micro[:, seq_idx+1,
