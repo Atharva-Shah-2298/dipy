@@ -30,6 +30,7 @@ from dipy.reconst.dti import (
     robust_fit_tensor_wls,
 )
 from dipy.reconst.multi_voxel import multi_voxel_fit
+from dipy.reconst.dkispeed import mean_kurtosis_analytical
 from dipy.reconst.recspeed import local_maxima
 from dipy.reconst.utils import dki_design_matrix as design_matrix
 from dipy.reconst.vec_val_sum import vec_val_vect
@@ -785,29 +786,15 @@ def mean_kurtosis(
     dki_params = dki_params.reshape((-1, dki_params.shape[-1]))
 
     if analytical:
-        # Split the model parameters to three variable containing the evals,
-        # evecs, and kurtosis elements
-        evals, evecs, kt = split_dki_param(dki_params)
-
-        # Rotate the kurtosis tensor from the standard Cartesian coordinate
-        # system to another coordinate system in which the 3 orthonormal
-        # eigenvectors of DT are the base coordinate
-        Wxxxx = Wrotate_element(kt, 0, 0, 0, 0, evecs)
-        Wyyyy = Wrotate_element(kt, 1, 1, 1, 1, evecs)
-        Wzzzz = Wrotate_element(kt, 2, 2, 2, 2, evecs)
-        Wxxyy = Wrotate_element(kt, 0, 0, 1, 1, evecs)
-        Wxxzz = Wrotate_element(kt, 0, 0, 2, 2, evecs)
-        Wyyzz = Wrotate_element(kt, 1, 1, 2, 2, evecs)
-
-        # Compute MK
-        MK = (
-            _F1m(evals[..., 0], evals[..., 1], evals[..., 2]) * Wxxxx
-            + _F1m(evals[..., 1], evals[..., 0], evals[..., 2]) * Wyyyy
-            + _F1m(evals[..., 2], evals[..., 1], evals[..., 0]) * Wzzzz
-            + _F2m(evals[..., 0], evals[..., 1], evals[..., 2]) * Wyyzz
-            + _F2m(evals[..., 1], evals[..., 0], evals[..., 2]) * Wxxzz
-            + _F2m(evals[..., 2], evals[..., 1], evals[..., 0]) * Wxxyy
+        # Use Cython-optimized analytical solution
+        # Ensure data is contiguous and of the right type
+        dki_params_c = np.ascontiguousarray(dki_params, dtype=np.float64)
+        MK = mean_kurtosis_analytical(
+            dki_params_c,
+            min_kurtosis=min_kurtosis if min_kurtosis is not None else -np.inf,
+            max_kurtosis=max_kurtosis if max_kurtosis is not None else np.inf,
         )
+        # Note: clipping is already done in the Cython function
 
     else:
         # Numerical Solution using t-design of 45 directions
@@ -816,11 +803,11 @@ def mean_kurtosis(
         KV = apparent_kurtosis_coef(dki_params, sph, min_kurtosis=min_kurtosis)
         MK = np.mean(KV, axis=-1)
 
-    if min_kurtosis is not None:
-        MK = MK.clip(min=min_kurtosis)
+        if min_kurtosis is not None:
+            MK = MK.clip(min=min_kurtosis)
 
-    if max_kurtosis is not None:
-        MK = MK.clip(max=max_kurtosis)
+        if max_kurtosis is not None:
+            MK = MK.clip(max=max_kurtosis)
 
     return MK.reshape(outshape)
 
