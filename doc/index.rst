@@ -21,6 +21,13 @@ Quick links
 .. grid:: 2
     :gutter: 3
 
+    .. grid-item-card:: :octicon:`book` Workshop Handbook
+        :link: user_guide/workshop_handbook
+        :link-type: any
+
+        Complete beginner's guide! Perfect for DIPY workshops and newcomers.
+        Step-by-step tutorials from installation to advanced analysis.
+
     .. grid-item-card:: :octicon:`rocket` Get started
         :link: user_guide/installation
         :link-type: any
