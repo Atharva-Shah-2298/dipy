@@ -107,9 +107,9 @@ DIPY works seamlessly with::
 * **scipy**: Scientific computing tools
 * **numpy**: Array operations
 
-**************************
+***************************
 3. Understanding the Basics
-**************************
+***************************
 
 Key Concepts in Diffusion MRI
 ==============================
@@ -148,9 +148,9 @@ DIPY Data Structure
 * **Affine matrix**: Maps voxel coordinates to real-world coordinates
 * **Mask**: Binary array indicating brain vs. background voxels
 
-****************************
+*****************************
 4. Core DIPY Modules Overview
-****************************
+*****************************
 
 DIPY is organized into specialized modules:
 
@@ -836,9 +836,9 @@ When asking for help, provide:
     - Full error message
     - Minimal code to reproduce the issue
 
-*********************************
+**********************************
 11. Resources for Further Learning
-*********************************
+**********************************
 
 Official Documentation
 ======================
