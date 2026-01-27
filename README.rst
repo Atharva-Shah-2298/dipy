@@ -76,6 +76,22 @@ or using `conda`::
 For detailed installation instructions, including instructions for installing
 from source, please read our `installation documentation <https://docs.dipy.org/stable/user_guide/installation.html>`_.
 
+Workshop Handbook for Beginners
+--------------------------------
+
+New to DIPY or attending a DIPY workshop? Check out our comprehensive 
+`Workshop Handbook <https://docs.dipy.org/stable/user_guide/workshop_handbook.html>`_
+for beginners! This guide covers:
+
+* Introduction to DIPY and diffusion MRI concepts
+* Step-by-step installation and setup
+* Core DIPY modules and their uses
+* Complete tutorials from basic to advanced analysis
+* Best practices and troubleshooting tips
+* Resources for further learning
+
+Perfect for workshop attendees and anyone getting started with diffusion MRI analysis in Python!
+
 Python versions and dependencies
 --------------------------------
 
