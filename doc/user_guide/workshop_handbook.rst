@@ -338,7 +338,7 @@ Visualize fiber directions with color-coded FA::
     from dipy.io.image import load_nifti, save_nifti
     from dipy.io import read_bvals_bvecs
     from dipy.core.gradients import gradient_table
-    from dipy.reconst.dti import TensorModel, color_fa
+    from dipy.reconst.dti import TensorModel
     
     # Load data
     data, affine = load_nifti('dwi.nii.gz')
@@ -428,9 +428,7 @@ Create streamlines representing white matter pathways::
     from dipy.tracking import utils
     from dipy.tracking.local_tracking import LocalTracking
     from dipy.tracking.streamline import Streamlines
-    from dipy.io.streamline import save_trk
-    from dipy.data import default_sphere
-    from dipy.direction import peaks_from_model
+    from dipy.segment.mask import median_otsu
     
     # 1. Load data
     data, affine = load_nifti('dwi.nii.gz')
@@ -438,7 +436,6 @@ Create streamlines representing white matter pathways::
     gtab = gradient_table(bvals, bvecs)
     
     # 2. Brain mask
-    from dipy.segment.mask import median_otsu
     b0_mask, mask = median_otsu(data, vol_idx=range(10), median_radius=3,
                                   numpass=1)
     
@@ -490,6 +487,7 @@ Workflow 3: Working with Example Data
 
 DIPY provides example datasets for learning::
 
+    import numpy as np
     from dipy.data import get_fnames
     from dipy.io.image import load_nifti
     from dipy.io import read_bvals_bvecs
@@ -629,15 +627,20 @@ Beyond DTI: Multi-shell Models
 
 For multi-shell data (multiple b-values), use advanced models::
 
+    import numpy as np
     from dipy.reconst.dki import DiffusionKurtosisModel
     from dipy.io.image import load_nifti, save_nifti
     from dipy.io import read_bvals_bvecs
     from dipy.core.gradients import gradient_table
+    from dipy.segment.mask import median_otsu
     
     # Load multi-shell data
     data, affine = load_nifti('dwi.nii.gz')
     bvals, bvecs = read_bvals_bvecs('dwi.bval', 'dwi.bvec')
     gtab = gradient_table(bvals, bvecs)
+    
+    # Create brain mask
+    b0_mask, mask = median_otsu(data, vol_idx=range(10), median_radius=3)
     
     # Check for multi-shell
     print("B-values:", np.unique(gtab.bvals))
@@ -663,6 +666,19 @@ Better for crossing fibers::
     from dipy.reconst.csdeconv import (ConstrainedSphericalDeconvModel,
                                         auto_response_ssst)
     from dipy.data import default_sphere
+    from dipy.direction import peaks_from_model
+    from dipy.io.image import load_nifti
+    from dipy.io import read_bvals_bvecs
+    from dipy.core.gradients import gradient_table
+    from dipy.segment.mask import median_otsu
+    
+    # Load data
+    data, affine = load_nifti('dwi.nii.gz')
+    bvals, bvecs = read_bvals_bvecs('dwi.bval', 'dwi.bvec')
+    gtab = gradient_table(bvals, bvecs)
+    
+    # Create brain mask
+    b0_mask, mask = median_otsu(data, vol_idx=range(10), median_radius=3)
     
     # Estimate response function
     response, ratio = auto_response_ssst(gtab, data, roi_radii=10, fa_thr=0.7)
@@ -675,7 +691,6 @@ Better for crossing fibers::
     csd_odf = csd_fit.odf(default_sphere)
     
     # Peak detection
-    from dipy.direction import peaks_from_model
     csd_peaks = peaks_from_model(
         csd_model,
         data,
