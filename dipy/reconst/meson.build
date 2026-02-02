@@ -1,4 +1,5 @@
 cython_sources = [
+  '_force_heap',
   'dirspeed',
   'eudx_direction_getter',
   'quick_squash',
@@ -7,6 +8,7 @@ cython_sources = [
   ]
 
 cython_headers = [
+  '_force_heap.pxd',
   'recspeed.pxd',
   ]
 
@@ -25,6 +27,7 @@ endforeach
 python_sources = ['__init__.py',
   'base.py',
   'bingham.py',
+  'force.py',
   'cache.py',
   'cross_validation.py',
   'csdeconv.py',
