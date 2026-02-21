@@ -251,8 +251,7 @@ class SlrWithQbxFlow(Workflow):
         remove_invalid_streamlines : bool, optional
             If True, streamlines outside the volume bounding box are removed
             before saving. When enabled, ``bbox_valid_check`` is automatically
-            set to False during saving to avoid raising an error before
-            the removal can occur.
+            set to False.
         out_dir : string, optional
             Output directory.
         out_moved : string, optional
