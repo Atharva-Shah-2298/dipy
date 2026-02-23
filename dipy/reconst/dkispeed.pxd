@@ -19,6 +19,12 @@ cdef double F1m_single(double a, double b, double c,
 cdef double F2m_single(double a, double b, double c, 
                         double er=*) noexcept nogil
 
+cdef double G1m_single(double a, double b, double c,
+                        double er=*) noexcept nogil
+
+cdef double G2m_single(double a, double b, double c,
+                        double er=*) noexcept nogil
+
 cdef double Wrotate_element_single(double[:] kt, int indi, int indj, 
                                     int indk, int indl, 
                                     double[:, :] B) noexcept nogil

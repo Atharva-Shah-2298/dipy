@@ -303,6 +303,58 @@ cdef double F1m_single(double a, double b, double c, double er=2.5e-2) noexcept 
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
+cdef double G1m_single(double a, double b, double c, double er=2.5e-2) noexcept nogil:
+    """Compute function G1 for a single voxel.
+
+    Helper function required to compute the analytical solution of Radial
+    Kurtosis.
+    """
+    cdef double L1, L2, G1
+
+    if not positive_evals_single(a, b, c):
+        return 0.0
+
+    if fabs(b - c) >= b * er:
+        G1 = ((a + b + c) * (a + b + c) /
+              (18.0 * b * (b - c) * (b - c)) *
+              (2.0 * b + (c * c - 3.0 * b * c) / sqrt(b * c)))
+        return G1
+
+    # Singularity b==c
+    L1 = a
+    L2 = b
+    G1 = (L1 + 2.0 * L2) * (L1 + 2.0 * L2) / (24.0 * L2 * L2)
+    return G1
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef double G2m_single(double a, double b, double c, double er=2.5e-2) noexcept nogil:
+    """Compute function G2 for a single voxel.
+
+    Helper function required to compute the analytical solution of Radial
+    Kurtosis.
+    """
+    cdef double L1, L2, G2
+
+    if not positive_evals_single(a, b, c):
+        return 0.0
+
+    if fabs(b - c) >= b * er:
+        G2 = ((a + b + c) * (a + b + c) /
+              (3.0 * (b - c) * (b - c)) *
+              ((b + c) / sqrt(b * c) - 2.0))
+        return G2
+
+    # Singularity b==c
+    L1 = a
+    L2 = b
+    G2 = (L1 + 2.0 * L2) * (L1 + 2.0 * L2) / (12.0 * L2 * L2)
+    return G2
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
 cdef double Wrotate_element_single(double[:] kt, int indi, int indj, 
                                     int indk, int indl, 
                                     double[:, :] B) noexcept nogil:
@@ -427,3 +479,204 @@ def mean_kurtosis_analytical(double[:, :] dki_params_flat,
             MK[v] = mk_val
     
     return np.asarray(MK)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def axial_kurtosis_analytical(double[:, :] dki_params_flat,
+                               double min_kurtosis=-3.0/7.0,
+                               double max_kurtosis=10.0):
+    """Compute axial kurtosis using the analytical solution.
+
+    Parameters
+    ----------
+    dki_params_flat : ndarray (n, 27)
+        Flattened DKI parameters array.
+    min_kurtosis : float, optional
+        Minimum kurtosis value for clipping.
+    max_kurtosis : float, optional
+        Maximum kurtosis value for clipping.
+
+    Returns
+    -------
+    AK : ndarray (n,)
+        Axial kurtosis values.
+    """
+    cdef:
+        cnp.npy_intp n_voxels = dki_params_flat.shape[0]
+        cnp.npy_intp v
+        double[:] AK = np.zeros(n_voxels, dtype=np.float64)
+        double[:, :] evecs = np.zeros((3, 3), dtype=np.float64)
+        double[:] kt = np.zeros(15, dtype=np.float64)
+        double L1, L2, L3, md, Wxxxx, ak_val
+        int i, j
+
+    with nogil:
+        for v in range(n_voxels):
+            L1 = dki_params_flat[v, 0]
+            L2 = dki_params_flat[v, 1]
+            L3 = dki_params_flat[v, 2]
+
+            if not positive_evals_single(L1, L2, L3):
+                AK[v] = 0.0
+                continue
+
+            for i in range(3):
+                for j in range(3):
+                    evecs[i, j] = dki_params_flat[v, 3 + i * 3 + j]
+
+            for i in range(15):
+                kt[i] = dki_params_flat[v, 12 + i]
+
+            Wxxxx = Wrotate_element_single(kt, 0, 0, 0, 0, evecs)
+
+            md = (L1 + L2 + L3) / 3.0
+            ak_val = Wxxxx * (md * md) / (L1 * L1)
+
+            if ak_val < min_kurtosis:
+                ak_val = min_kurtosis
+            if ak_val > max_kurtosis:
+                ak_val = max_kurtosis
+
+            AK[v] = ak_val
+
+    return np.asarray(AK)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def radial_kurtosis_analytical(double[:, :] dki_params_flat,
+                                double min_kurtosis=-3.0/7.0,
+                                double max_kurtosis=10.0):
+    """Compute radial kurtosis using the analytical solution.
+
+    Parameters
+    ----------
+    dki_params_flat : ndarray (n, 27)
+        Flattened DKI parameters array.
+    min_kurtosis : float, optional
+        Minimum kurtosis value for clipping.
+    max_kurtosis : float, optional
+        Maximum kurtosis value for clipping.
+
+    Returns
+    -------
+    RK : ndarray (n,)
+        Radial kurtosis values.
+    """
+    cdef:
+        cnp.npy_intp n_voxels = dki_params_flat.shape[0]
+        cnp.npy_intp v
+        double[:] RK = np.zeros(n_voxels, dtype=np.float64)
+        double[:, :] evecs = np.zeros((3, 3), dtype=np.float64)
+        double[:] kt = np.zeros(15, dtype=np.float64)
+        double L1, L2, L3
+        double Wyyyy, Wzzzz, Wyyzz
+        double rk_val
+        int i, j
+
+    with nogil:
+        for v in range(n_voxels):
+            L1 = dki_params_flat[v, 0]
+            L2 = dki_params_flat[v, 1]
+            L3 = dki_params_flat[v, 2]
+
+            if not positive_evals_single(L1, L2, L3):
+                RK[v] = 0.0
+                continue
+
+            for i in range(3):
+                for j in range(3):
+                    evecs[i, j] = dki_params_flat[v, 3 + i * 3 + j]
+
+            for i in range(15):
+                kt[i] = dki_params_flat[v, 12 + i]
+
+            Wyyyy = Wrotate_element_single(kt, 1, 1, 1, 1, evecs)
+            Wzzzz = Wrotate_element_single(kt, 2, 2, 2, 2, evecs)
+            Wyyzz = Wrotate_element_single(kt, 1, 1, 2, 2, evecs)
+
+            rk_val = (G1m_single(L1, L2, L3) * Wyyyy +
+                      G1m_single(L1, L3, L2) * Wzzzz +
+                      G2m_single(L1, L2, L3) * Wyyzz)
+
+            if rk_val < min_kurtosis:
+                rk_val = min_kurtosis
+            if rk_val > max_kurtosis:
+                rk_val = max_kurtosis
+
+            RK[v] = rk_val
+
+    return np.asarray(RK)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def kurtosis_fractional_anisotropy_c(double[:, :] dki_params_flat):
+    """Compute kurtosis fractional anisotropy (KFA).
+
+    Parameters
+    ----------
+    dki_params_flat : ndarray (n, 27)
+        Flattened DKI parameters array.
+
+    Returns
+    -------
+    KFA : ndarray (n,)
+        Kurtosis fractional anisotropy values.
+    """
+    cdef:
+        cnp.npy_intp n_voxels = dki_params_flat.shape[0]
+        cnp.npy_intp v
+        double[:] KFA = np.zeros(n_voxels, dtype=np.float64)
+        double Wxxxx, Wyyyy, Wzzzz
+        double Wxxxy, Wxxxz, Wxyyy, Wyyyz, Wxzzz, Wyzzz
+        double Wxxyy, Wxxzz, Wyyzz
+        double Wxxyz, Wxyyz, Wxyzz
+        double W, A, B
+
+    with nogil:
+        for v in range(n_voxels):
+            Wxxxx = dki_params_flat[v, 12]
+            Wyyyy = dki_params_flat[v, 13]
+            Wzzzz = dki_params_flat[v, 14]
+            Wxxxy = dki_params_flat[v, 15]
+            Wxxxz = dki_params_flat[v, 16]
+            Wxyyy = dki_params_flat[v, 17]
+            Wyyyz = dki_params_flat[v, 18]
+            Wxzzz = dki_params_flat[v, 19]
+            Wyzzz = dki_params_flat[v, 20]
+            Wxxyy = dki_params_flat[v, 21]
+            Wxxzz = dki_params_flat[v, 22]
+            Wyyzz = dki_params_flat[v, 23]
+            Wxxyz = dki_params_flat[v, 24]
+            Wxyyz = dki_params_flat[v, 25]
+            Wxyzz = dki_params_flat[v, 26]
+
+            W = (1.0 / 5.0) * (Wxxxx + Wyyyy + Wzzzz +
+                                2.0 * Wxxyy + 2.0 * Wxxzz + 2.0 * Wyyzz)
+
+            A = ((Wxxxx - W) * (Wxxxx - W) +
+                 (Wyyyy - W) * (Wyyyy - W) +
+                 (Wzzzz - W) * (Wzzzz - W) +
+                 4.0 * (Wxxxy * Wxxxy + Wxxxz * Wxxxz +
+                        Wxyyy * Wxyyy + Wyyyz * Wyyyz +
+                        Wxzzz * Wxzzz + Wyzzz * Wyzzz) +
+                 6.0 * ((Wxxyy - W / 3.0) * (Wxxyy - W / 3.0) +
+                        (Wxxzz - W / 3.0) * (Wxxzz - W / 3.0) +
+                        (Wyyzz - W / 3.0) * (Wyyzz - W / 3.0)) +
+                 12.0 * (Wxxyz * Wxxyz + Wxyyz * Wxyyz + Wxyzz * Wxyzz))
+
+            B = (Wxxxx * Wxxxx + Wyyyy * Wyyyy + Wzzzz * Wzzzz +
+                 4.0 * (Wxxxy * Wxxxy + Wxxxz * Wxxxz +
+                        Wxyyy * Wxyyy + Wyyyz * Wyyyz +
+                        Wxzzz * Wxzzz + Wyzzz * Wyzzz) +
+                 6.0 * (Wxxyy * Wxxyy + Wxxzz * Wxxzz + Wyyzz * Wyyzz) +
+                 12.0 * (Wxxyz * Wxxyz + Wxyyz * Wxyyz + Wxyzz * Wxyzz))
+
+            if B > 0.0 and W > 1e-8:
+                KFA[v] = sqrt(A / B)
+            else:
+                KFA[v] = 0.0
+
+    return np.asarray(KFA)
