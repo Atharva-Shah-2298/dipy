@@ -15,6 +15,12 @@ from dipy.core.optimize import PositiveDefiniteLeastSquares
 import dipy.core.sphere as dps
 from dipy.data import get_fnames, get_sphere, load_sdp_constraints
 from dipy.reconst.base import ReconstModel
+from dipy.reconst.dkispeed import (
+    axial_kurtosis_analytical,
+    kurtosis_fractional_anisotropy_c,
+    mean_kurtosis_analytical,
+    radial_kurtosis_analytical,
+)
 from dipy.reconst.dti import (
     MIN_POSITIVE_SIGNAL,
     TensorFit,
@@ -30,12 +36,6 @@ from dipy.reconst.dti import (
     robust_fit_tensor_wls,
 )
 from dipy.reconst.multi_voxel import multi_voxel_fit
-from dipy.reconst.dkispeed import (
-    mean_kurtosis_analytical,
-    axial_kurtosis_analytical,
-    radial_kurtosis_analytical,
-    kurtosis_fractional_anisotropy_c,
-)
 from dipy.reconst.recspeed import local_maxima
 from dipy.reconst.utils import dki_design_matrix as design_matrix
 from dipy.reconst.vec_val_sum import vec_val_vect
@@ -654,7 +654,6 @@ def apparent_kurtosis_coef(
     outshape = dki_params.shape[:-1]
     dki_params = dki_params.reshape((-1, dki_params.shape[-1]))
 
-    # Split data
     evals, evecs, kt = split_dki_param(dki_params)
 
     # Initialize AKC matrix
@@ -691,8 +690,7 @@ def apparent_kurtosis_coef(
 
 @warning_for_keywords()
 def mean_kurtosis(
-    dki_params, *, min_kurtosis=-3.0 / 7, max_kurtosis=3, analytical=True,
-    fast=True
+    dki_params, *, min_kurtosis=-3.0 / 7, max_kurtosis=3, analytical=True, fast=True
 ):
     r""" Compute mean kurtosis (MK) from the kurtosis tensor.
 
@@ -725,7 +723,7 @@ def mean_kurtosis(
     fast : bool, optional
         If True and analytical is True, use the Cython-optimized analytical
         solution. If False, use the pure Python analytical solution. Both
-        produce identical results. Default is True.
+        produce identical results.
 
     Returns
     -------
@@ -800,15 +798,11 @@ def mean_kurtosis(
             dki_params_c = np.ascontiguousarray(dki_params, dtype=np.float64)
             MK = mean_kurtosis_analytical(
                 dki_params_c,
-                min_kurtosis=min_kurtosis if min_kurtosis is not None
-                else -np.inf,
-                max_kurtosis=max_kurtosis if max_kurtosis is not None
-                else np.inf,
+                min_kurtosis=min_kurtosis if min_kurtosis is not None else -np.inf,
+                max_kurtosis=max_kurtosis if max_kurtosis is not None else np.inf,
             )
             return MK.reshape(outshape)
 
-        # Split the model parameters to three variable containing the
-        # evals, evecs, and kurtosis elements
         evals, evecs, kt = split_dki_param(dki_params)
 
         # Rotate the kurtosis tensor from the standard Cartesian coordinate
@@ -981,8 +975,7 @@ def _G2m(a, b, c):
 
 @warning_for_keywords()
 def radial_kurtosis(
-    dki_params, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True,
-    fast=True
+    dki_params, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True, fast=True
 ):
     r"""Compute radial kurtosis (RK) of a diffusion kurtosis tensor.
 
@@ -1016,7 +1009,7 @@ def radial_kurtosis(
     fast : bool, optional
         If True and analytical is True, use the Cython-optimized analytical
         solution. If False, use the pure Python analytical solution. Both
-        produce identical results. Default is True.
+        produce identical results.
 
     Returns
     -------
@@ -1073,8 +1066,6 @@ def radial_kurtosis(
     outshape = dki_params.shape[:-1]
     dki_params = dki_params.reshape((-1, dki_params.shape[-1]))
 
-    # Split the model parameters to three variable containing the evals,
-    # evecs, and kurtosis elements
     evals, evecs, kt = split_dki_param(dki_params)
 
     if analytical:
@@ -1082,10 +1073,8 @@ def radial_kurtosis(
             dki_params_c = np.ascontiguousarray(dki_params, dtype=np.float64)
             RK = radial_kurtosis_analytical(
                 dki_params_c,
-                min_kurtosis=min_kurtosis if min_kurtosis is not None
-                else -np.inf,
-                max_kurtosis=max_kurtosis if max_kurtosis is not None
-                else np.inf,
+                min_kurtosis=min_kurtosis if min_kurtosis is not None else -np.inf,
+                max_kurtosis=max_kurtosis if max_kurtosis is not None else np.inf,
             )
             return RK.reshape(outshape)
 
@@ -1139,8 +1128,7 @@ def radial_kurtosis(
 
 @warning_for_keywords()
 def axial_kurtosis(
-    dki_params, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True,
-    fast=True
+    dki_params, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True, fast=True
 ):
     r"""Compute axial kurtosis (AK) from the kurtosis tensor.
 
@@ -1175,7 +1163,7 @@ def axial_kurtosis(
     fast : bool, optional
         If True and analytical is True, use the Cython-optimized analytical
         solution. If False, use the pure Python analytical solution. Both
-        produce identical results. Default is True.
+        produce identical results.
 
     Returns
     -------
@@ -1236,10 +1224,8 @@ def axial_kurtosis(
             dki_params_c = np.ascontiguousarray(dki_params, dtype=np.float64)
             AK = axial_kurtosis_analytical(
                 dki_params_c,
-                min_kurtosis=min_kurtosis if min_kurtosis is not None
-                else -np.inf,
-                max_kurtosis=max_kurtosis if max_kurtosis is not None
-                else np.inf,
+                min_kurtosis=min_kurtosis if min_kurtosis is not None else -np.inf,
+                max_kurtosis=max_kurtosis if max_kurtosis is not None else np.inf,
             )
             return AK.reshape(outshape)
 
@@ -1571,8 +1557,6 @@ def radial_tensor_kurtosis(dki_params, *, min_kurtosis=-3.0 / 7, max_kurtosis=10
     outshape = dki_params.shape[:-1]
     dki_params = dki_params.reshape((-1, dki_params.shape[-1]))
 
-    # Split the model parameters to three variable containing the evals,
-    # evecs, and kurtosis elements
     evals, evecs, kt = split_dki_param(dki_params)
 
     # Initializes RKT
@@ -1626,8 +1610,7 @@ def kurtosis_fractional_anisotropy(dki_params, fast=True):
             3) Fifteen elements of the kurtosis tensor
     fast : bool, optional
         If True, use the Cython-optimized implementation. If False, use the
-        pure Python implementation. Both produce identical results. Default
-        is True.
+        pure Python implementation. Both produce identical results.
 
     Returns
     -------
@@ -2209,8 +2192,7 @@ class DiffusionKurtosisFit(TensorFit):
         return apparent_kurtosis_coef(self.model_params, sphere)
 
     @warning_for_keywords()
-    def mk(self, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True,
-            fast=True):
+    def mk(self, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True, fast=True):
         r""" Compute mean kurtosis (MK) from the kurtosis tensor.
 
         See :footcite:t:`Tabesh2011` and :footcite:p:`NetoHenriques2021a` for
@@ -2233,7 +2215,7 @@ class DiffusionKurtosisFit(TensorFit):
             an exact numerical estimator is used (see Notes).
         fast : bool, optional
             If True and analytical is True, use the Cython-optimized analytical
-            solution. Default is True.
+            solution.
 
         Returns
         -------
@@ -2307,8 +2289,7 @@ class DiffusionKurtosisFit(TensorFit):
         )
 
     @warning_for_keywords()
-    def ak(self, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True,
-            fast=True):
+    def ak(self, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True, fast=True):
         r"""
         Compute axial kurtosis (AK) of a diffusion kurtosis tensor.
 
@@ -2334,7 +2315,7 @@ class DiffusionKurtosisFit(TensorFit):
             (see notes).
         fast : bool, optional
             If True and analytical is True, use the Cython-optimized analytical
-            solution. Default is True.
+            solution.
 
         Returns
         -------
@@ -2377,8 +2358,7 @@ class DiffusionKurtosisFit(TensorFit):
         )
 
     @warning_for_keywords()
-    def rk(self, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True,
-            fast=True):
+    def rk(self, *, min_kurtosis=-3.0 / 7, max_kurtosis=10, analytical=True, fast=True):
         r"""Compute radial kurtosis (RK) of a diffusion kurtosis tensor.
 
         See :footcite:p:`Tabesh2011` for further details about the method.
@@ -2400,7 +2380,7 @@ class DiffusionKurtosisFit(TensorFit):
             an exact numerical estimator is used (see Notes).
         fast : bool, optional
             If True and analytical is True, use the Cython-optimized analytical
-            solution. Default is True.
+            solution.
 
         Returns
         -------

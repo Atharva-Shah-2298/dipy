@@ -1196,9 +1196,6 @@ def test_fast_vs_python_analytical():
     # Test via class methods
     dkiM = dki.DiffusionKurtosisModel(gtab_2s)
     dkiF = dkiM.fit(DWI)
-    assert_array_almost_equal(
-        dkiF.mk(fast=True), dkiF.mk(fast=False))
-    assert_array_almost_equal(
-        dkiF.ak(fast=True), dkiF.ak(fast=False))
-    assert_array_almost_equal(
-        dkiF.rk(fast=True), dkiF.rk(fast=False))
+    assert_array_almost_equal(dkiF.mk(fast=True), dkiF.mk(fast=False))
+    assert_array_almost_equal(dkiF.ak(fast=True), dkiF.ak(fast=False))
+    assert_array_almost_equal(dkiF.rk(fast=True), dkiF.rk(fast=False))

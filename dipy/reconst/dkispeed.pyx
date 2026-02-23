@@ -64,16 +64,31 @@ cdef inline int get_kt_index(int key) noexcept nogil:
         return 0
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef inline bint positive_evals_single(double L1, double L2, double L3, 
                                         double er=2e-7) noexcept nogil:
-    """Check if all eigenvalues are significantly larger than zero."""
+    """Check if all eigenvalues are significantly larger than zero.
+
+    Parameters
+    ----------
+    L1 : double
+        First eigenvalue of the diffusion tensor.
+    L2 : double
+        Second eigenvalue of the diffusion tensor.
+    L3 : double
+        Third eigenvalue of the diffusion tensor.
+    er : double, optional
+        Threshold below which an eigenvalue is considered non-positive.
+
+    Returns
+    -------
+    result : bint
+        True if all three eigenvalues exceed ``er``, False otherwise.
+    """
     return L1 > er and L2 > er and L3 > er
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef double carlson_rf_single(double x, double y, double z, 
                                double errtol=3e-4) noexcept nogil:
     """Compute Carlson's incomplete elliptic integral of the first kind
@@ -133,8 +148,7 @@ cdef double carlson_rf_single(double x, double y, double z,
     return RF
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef double carlson_rd_single(double x, double y, double z, 
                                double errtol=1e-4) noexcept nogil:
     """Compute Carlson's incomplete elliptic integral of the second kind
@@ -205,12 +219,29 @@ cdef double carlson_rd_single(double x, double y, double z,
     return RD
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef double F2m_single(double a, double b, double c, double er=2.5e-2) noexcept nogil:
     """Compute function F2 for a single voxel.
-    
-    Helper function required to compute the analytical solution of Mean Kurtosis.
+
+    Helper function required to compute the analytical solution of Mean
+    Kurtosis.
+
+    Parameters
+    ----------
+    a : double
+        First diffusion tensor eigenvalue.
+    b : double
+        Second diffusion tensor eigenvalue.
+    c : double
+        Third diffusion tensor eigenvalue.
+    er : double, optional
+        Relative tolerance for detecting degenerate eigenvalue pairs.
+
+    Returns
+    -------
+    F2 : double
+        Value of the F2 function. Returns 0.0 when eigenvalues are
+        non-positive.
     """
     cdef:
         double L1, L2, L3, RF, RD, F2
@@ -256,12 +287,29 @@ cdef double F2m_single(double a, double b, double c, double er=2.5e-2) noexcept 
     return F2
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef double F1m_single(double a, double b, double c, double er=2.5e-2) noexcept nogil:
     """Compute function F1 for a single voxel.
-    
-    Helper function required to compute the analytical solution of Mean Kurtosis.
+
+    Helper function required to compute the analytical solution of Mean
+    Kurtosis.
+
+    Parameters
+    ----------
+    a : double
+        First diffusion tensor eigenvalue.
+    b : double
+        Second diffusion tensor eigenvalue.
+    c : double
+        Third diffusion tensor eigenvalue.
+    er : double, optional
+        Relative tolerance for detecting degenerate eigenvalue pairs.
+
+    Returns
+    -------
+    F1 : double
+        Value of the F1 function. Returns 0.0 when eigenvalues are
+        non-positive, or 1/5 in the fully isotropic case.
     """
     cdef:
         double L1, L2, L3, RF, RD, F1
@@ -301,13 +349,29 @@ cdef double F1m_single(double a, double b, double c, double er=2.5e-2) noexcept 
     return F1
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef double G1m_single(double a, double b, double c, double er=2.5e-2) noexcept nogil:
     """Compute function G1 for a single voxel.
 
     Helper function required to compute the analytical solution of Radial
     Kurtosis.
+
+    Parameters
+    ----------
+    a : double
+        First diffusion tensor eigenvalue (axial).
+    b : double
+        Second diffusion tensor eigenvalue (radial).
+    c : double
+        Third diffusion tensor eigenvalue (radial).
+    er : double, optional
+        Relative tolerance for detecting the singularity b == c.
+
+    Returns
+    -------
+    G1 : double
+        Value of the G1 function. Returns 0.0 when eigenvalues are
+        non-positive.
     """
     cdef double L1, L2, G1
 
@@ -327,13 +391,29 @@ cdef double G1m_single(double a, double b, double c, double er=2.5e-2) noexcept 
     return G1
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef double G2m_single(double a, double b, double c, double er=2.5e-2) noexcept nogil:
     """Compute function G2 for a single voxel.
 
     Helper function required to compute the analytical solution of Radial
     Kurtosis.
+
+    Parameters
+    ----------
+    a : double
+        First diffusion tensor eigenvalue (axial).
+    b : double
+        Second diffusion tensor eigenvalue (radial).
+    c : double
+        Third diffusion tensor eigenvalue (radial).
+    er : double, optional
+        Relative tolerance for detecting the singularity b == c.
+
+    Returns
+    -------
+    G2 : double
+        Value of the G2 function. Returns 0.0 when eigenvalues are
+        non-positive.
     """
     cdef double L1, L2, G2
 
@@ -353,8 +433,7 @@ cdef double G2m_single(double a, double b, double c, double er=2.5e-2) noexcept 
     return G2
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 cdef double Wrotate_element_single(double[:] kt, int indi, int indj, 
                                     int indk, int indl, 
                                     double[:, :] B) noexcept nogil:
@@ -392,16 +471,15 @@ cdef double Wrotate_element_single(double[:] kt, int indi, int indj,
     return Wre
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 def mean_kurtosis_analytical(double[:, :] dki_params_flat,
                               double min_kurtosis=-3.0/7.0,
                               double max_kurtosis=3.0):
     """Compute mean kurtosis using the analytical solution.
-    
+
     This is the Cython-optimized version of the analytical mean kurtosis
     calculation.
-    
+
     Parameters
     ----------
     dki_params_flat : ndarray (n, 27)
@@ -410,7 +488,7 @@ def mean_kurtosis_analytical(double[:, :] dki_params_flat,
         Minimum kurtosis value for clipping.
     max_kurtosis : float, optional
         Maximum kurtosis value for clipping.
-    
+
     Returns
     -------
     MK : ndarray (n,)
@@ -481,8 +559,7 @@ def mean_kurtosis_analytical(double[:, :] dki_params_flat,
     return np.asarray(MK)
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 def axial_kurtosis_analytical(double[:, :] dki_params_flat,
                                double min_kurtosis=-3.0/7.0,
                                double max_kurtosis=10.0):
@@ -543,8 +620,7 @@ def axial_kurtosis_analytical(double[:, :] dki_params_flat,
     return np.asarray(AK)
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 def radial_kurtosis_analytical(double[:, :] dki_params_flat,
                                 double min_kurtosis=-3.0/7.0,
                                 double max_kurtosis=10.0):
@@ -610,8 +686,7 @@ def radial_kurtosis_analytical(double[:, :] dki_params_flat,
     return np.asarray(RK)
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+
 def kurtosis_fractional_anisotropy_c(double[:, :] dki_params_flat):
     """Compute kurtosis fractional anisotropy (KFA).
 
