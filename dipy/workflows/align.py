@@ -153,6 +153,11 @@ class ResliceFlow(Workflow):
                 )
                 source_file = Path(inputfile)
                 link_file = Path(outpfile)
+                if link_file.exists() and link_file.resolve() == source_file.resolve():
+                    logger.debug(f"{outpfile} already linked/copied. Skipping.")
+                    continue
+                if link_file.exists() or link_file.is_symlink():
+                    link_file.unlink()
                 try:
                     link_file.symlink_to(source_file.resolve())
                 except OSError:

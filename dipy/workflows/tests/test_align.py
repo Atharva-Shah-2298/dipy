@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -119,6 +120,30 @@ def test_reslice_skip_when_matching(caplog):
         resliced = load_nifti_data(out_path)
 
         npt.assert_equal(resliced.shape, volume.shape)
+
+
+def test_reslice_skip_idempotent(caplog):
+    """Test ResliceFlow is idempotent when force option is used."""
+
+    with TemporaryDirectory() as out_dir:
+        data_path, _, _ = get_fnames(name="small_25")
+        _, _, zooms = load_nifti(data_path, return_voxsize=True)
+        target_vox = list(zooms[:3])
+
+        with caplog.at_level(logging.INFO, logger="dipy"):
+            ResliceFlow().run(data_path, new_vox_size=target_vox, out_dir=out_dir)
+
+        caplog.clear()
+
+        with caplog.at_level(logging.INFO, logger="dipy"):
+            ResliceFlow(force=True).run(
+                data_path, new_vox_size=target_vox, out_dir=out_dir
+            )
+
+        info_messages = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert any("already linked" in m or "Skipping" in m for m in info_messages), (
+            "Expected idempotent skip message on second run. " f"Found: {info_messages}"
+        )
 
 
 def test_slr_flow(caplog):
