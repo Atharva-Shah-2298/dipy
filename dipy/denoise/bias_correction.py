@@ -8,7 +8,7 @@ log domain and applied uniformly to all DWI volumes.
 """
 
 import numpy as np
-from scipy import ndimage, sparse, linalg as scipy_linalg
+from scipy import linalg as scipy_linalg, ndimage, sparse
 
 try:
     from dipy.denoise._bias_correction import (
@@ -17,6 +17,7 @@ try:
         gram_matrix_csr,
         masked_voxel_coords,
     )
+
     _HAVE_CYTHON = True
 except ImportError:
     _HAVE_CYTHON = False
@@ -27,6 +28,7 @@ from dipy.utils.logging import logger
 
 try:
     from dipy.align.vector_fields import gradient as _vf_gradient
+
     _HAVE_VF_GRADIENT = True
 except ImportError:
     _HAVE_VF_GRADIENT = False
@@ -47,9 +49,7 @@ def _get_mean_b0(data, gtab):
     mean_b0 : ndarray
         3D mean b0 volume, dtype float64.
     """
-    return extract_b0(
-        data, gtab.b0s_mask, strategy="mean"
-    ).astype(np.float64)
+    return extract_b0(data, gtab.b0s_mask, strategy="mean").astype(np.float64)
 
 
 def _get_mask(mean_b0, mask):
@@ -95,12 +95,12 @@ def _gradient_weights(*, log_b0, alpha=1.0):
         eye4 = np.eye(4, dtype=np.float64)
         spacing = np.ones(3, dtype=np.float64)
         grad_out, _ = _vf_gradient(img, eye4, spacing, shape, eye4)
-        grad_mag = np.sqrt(np.sum(grad_out ** 2, axis=-1))
+        grad_mag = np.sqrt(np.sum(grad_out**2, axis=-1))
     else:
         gx = ndimage.sobel(img, axis=0)
         gy = ndimage.sobel(img, axis=1)
         gz = ndimage.sobel(img, axis=2)
-        grad_mag = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2)
+        grad_mag = np.sqrt(gx**2 + gy**2 + gz**2)
     return np.exp(-alpha * grad_mag)
 
 
@@ -219,7 +219,7 @@ def _tukey_weights_py(*, residuals, c):
     if mad < 1e-15:
         return np.ones(len(residuals), dtype=np.float64)
     u = residuals / (c * mad)
-    w = np.where(np.abs(u) < 1.0, (1.0 - u ** 2) ** 2, 0.0)
+    w = np.where(np.abs(u) < 1.0, (1.0 - u**2) ** 2, 0.0)
     return w.astype(np.float64)
 
 
@@ -240,9 +240,7 @@ def _tukey_weights(*, residuals, c=4.685):
     """
     if _HAVE_CYTHON:
         w = np.ones(len(residuals), dtype=np.float64)
-        compute_tukey_weights(
-            np.ascontiguousarray(residuals, dtype=np.float64), w, c=c
-        )
+        compute_tukey_weights(np.ascontiguousarray(residuals, dtype=np.float64), w, c=c)
         return w
     return _tukey_weights_py(residuals=residuals, c=c)
 
@@ -298,12 +296,8 @@ def _polynomial_pyramid_fit(
         np.arange(full_shape[2]),
         indexing="ij",
     )
-    full_vox_coords = np.column_stack(
-        [ii.ravel(), jj.ravel(), kk.ravel()]
-    )
-    full_coords_norm = _normalize_coords(
-        shape=full_shape, coords=full_vox_coords
-    )
+    full_vox_coords = np.column_stack([ii.ravel(), jj.ravel(), kk.ravel()])
+    full_coords_norm = _normalize_coords(shape=full_shape, coords=full_vox_coords)
     X_full = _legendre_basis(coords_flat=full_coords_norm, order=order)
 
     # Center log_b0 so the polynomial fits only spatial variation, not the
@@ -322,8 +316,7 @@ def _polynomial_pyramid_fit(
             smoothed = ndimage.gaussian_filter(residual, sigma=sigma)
             level_residual = ndimage.zoom(smoothed, zoom=1.0 / factor, order=1)
             level_mask = (
-                ndimage.zoom(mask.astype(np.float64), zoom=1.0 / factor, order=0)
-                > 0.5
+                ndimage.zoom(mask.astype(np.float64), zoom=1.0 / factor, order=0) > 0.5
             )
 
         level_shape = level_residual.shape
@@ -355,9 +348,7 @@ def _polynomial_pyramid_fit(
                 kk_l.ravel()[mask_flat],
             ]
         )
-        coords_norm = _normalize_coords(
-            shape=level_shape, coords=level_coords
-        )
+        coords_norm = _normalize_coords(shape=level_shape, coords=level_coords)
         X = _legendre_basis(coords_flat=coords_norm, order=order)
 
         w = np.ones(n_masked, dtype=np.float64)
@@ -371,17 +362,13 @@ def _polynomial_pyramid_fit(
 
         beta = None
         for _ in range(n_iter):
-            beta = _weighted_ridge_solve(
-                X=X, y=y, weights=w, lambda_reg=lambda_reg
-            )
+            beta = _weighted_ridge_solve(X=X, y=y, weights=w, lambda_reg=lambda_reg)
             residuals_iter = y - X @ beta
             if robust:
                 w = w * _tukey_weights(residuals=residuals_iter)
 
         if beta is None:
-            beta = _weighted_ridge_solve(
-                X=X, y=y, weights=w, lambda_reg=lambda_reg
-            )
+            beta = _weighted_ridge_solve(X=X, y=y, weights=w, lambda_reg=lambda_reg)
 
         level_bias = (X_full @ beta).reshape(full_shape)
         log_bias += level_bias
@@ -463,9 +450,9 @@ def polynomial_bias_field_dwi(
     if zero_background:
         log_bias[~mask] = 0.0
     bias_field = np.exp(log_bias)
-    corrected = applymask(
-        data.astype(np.float64) / bias_field[..., None], mask
-    ).astype(orig_dtype)
+    corrected = applymask(data.astype(np.float64) / bias_field[..., None], mask).astype(
+        orig_dtype
+    )
     return corrected, bias_field
 
 
@@ -526,7 +513,7 @@ def _build_bspline_design_matrix_py(*, log_b0_shape, n_control, mask_flat):
         ctrl = np.stack([k - 1, k, k + 1, k + 2], axis=-1)  # (N, 4)
         return b, ctrl
 
-    bz, cz = _bspline_basis_batch(tz, ns)   # (N, 4)
+    bz, cz = _bspline_basis_batch(tz, ns)  # (N, 4)
     by_, cy = _bspline_basis_batch(ty, nr)
     bx, cx = _bspline_basis_batch(tx, nc)
 
@@ -588,9 +575,7 @@ def _build_bspline_design_matrix(*, log_b0_shape, n_control, mask_flat):
         N_max = int(mask_flat.sum())
 
         out_coords = np.zeros((N_max, 3), dtype=np.int64)
-        N_actual = int(masked_voxel_coords(
-            np.ascontiguousarray(mask_3d), out_coords
-        ))
+        N_actual = int(masked_voxel_coords(np.ascontiguousarray(mask_3d), out_coords))
         out_coords = out_coords[:N_actual]
 
         def _scale(axis_coords, shape_d, n_ctrl_d):
@@ -611,13 +596,15 @@ def _build_bspline_design_matrix(*, log_b0_shape, n_control, mask_flat):
         col_idx = np.zeros(N_actual * 64, dtype=np.int64)
         values = np.zeros(N_actual * 64, dtype=np.float64)
 
-        nnz = int(evaluate_bspline_rows(
-            np.ascontiguousarray(grid_coords),
-            n_ctrl_arr,
-            row_ptr,
-            col_idx,
-            values,
-        ))
+        nnz = int(
+            evaluate_bspline_rows(
+                np.ascontiguousarray(grid_coords),
+                n_ctrl_arr,
+                row_ptr,
+                col_idx,
+                values,
+            )
+        )
         col_idx = col_idx[:nnz]
         values = values[:nnz]
 
@@ -679,9 +666,9 @@ def _sparse_weighted_ridge_solve(*, X_sparse, y, weights, lambda_reg):
         A = np.zeros((K, K), dtype=np.float64)
         b_vec = np.zeros(K, dtype=np.float64)
         for i in range(0, N, chunk):
-            Xc = X_sparse[i : i + chunk].toarray()   # (chunk, K)
+            Xc = X_sparse[i : i + chunk].toarray()  # (chunk, K)
             wc = weights[i : i + chunk]
-            A += Xc.T @ (wc[:, np.newaxis] * Xc)    # BLAS DGEMM
+            A += Xc.T @ (wc[:, np.newaxis] * Xc)  # BLAS DGEMM
             b_vec += Xc.T.dot(wc * y[i : i + chunk])
 
     A += lambda_reg * np.eye(K)
@@ -710,9 +697,7 @@ def _refine_control_coeffs(*, coeffs, n_ctrl_coarse, n_ctrl_fine):
         Flattened coefficients at fine resolution.
     """
     coarse_grid = coeffs.reshape(n_ctrl_coarse)
-    zoom_factors = tuple(
-        f / c for f, c in zip(n_ctrl_fine, n_ctrl_coarse)
-    )
+    zoom_factors = tuple(f / c for f, c in zip(n_ctrl_fine, n_ctrl_coarse))
     fine_grid = ndimage.zoom(coarse_grid, zoom=zoom_factors, order=1)
     # Trim or pad to exactly match target shape
     slices = tuple(slice(0, n) for n in n_ctrl_fine)
@@ -750,9 +735,7 @@ def _eval_bspline_field(*, coeffs, n_control, out_shape):
     S, R, C = out_shape
     ns, nr, nc = n_control
 
-    coeff_grid = np.ascontiguousarray(
-        coeffs.reshape(n_control), dtype=np.float64
-    )
+    coeff_grid = np.ascontiguousarray(coeffs.reshape(n_control), dtype=np.float64)
 
     iz = np.linspace(0, ns - 1, S) if ns > 1 else np.zeros(S)
     iy = np.linspace(0, nr - 1, R) if nr > 1 else np.zeros(R)
@@ -822,9 +805,7 @@ def _bspline_pyramid_fit(
     prev_n_ctrl = None
 
     for factor in pyramid_levels:
-        n_ctrl = tuple(
-            max(2, int(np.round(n / factor))) for n in n_control_points
-        )
+        n_ctrl = tuple(max(2, int(np.round(n / factor))) for n in n_control_points)
 
         if factor == 1:
             level_residual = residual
@@ -834,8 +815,7 @@ def _bspline_pyramid_fit(
             smoothed = ndimage.gaussian_filter(residual, sigma=sigma)
             level_residual = ndimage.zoom(smoothed, zoom=1.0 / factor, order=1)
             level_mask = (
-                ndimage.zoom(mask.astype(np.float64), zoom=1.0 / factor, order=0)
-                > 0.5
+                ndimage.zoom(mask.astype(np.float64), zoom=1.0 / factor, order=0) > 0.5
             )
 
         level_shape = level_residual.shape
@@ -961,9 +941,7 @@ def _auto_select_fit(
 
     def _cov(log_bf):
         """CoV of mean b0 corrected by the given log bias field."""
-        corrected_b0 = mean_b0 / np.where(
-            np.exp(log_bf) > 1e-10, np.exp(log_bf), 1.0
-        )
+        corrected_b0 = mean_b0 / np.where(np.exp(log_bf) > 1e-10, np.exp(log_bf), 1.0)
         vals = corrected_b0[mask]
         return vals.std() / (vals.mean() + 1e-12)
 
@@ -972,16 +950,14 @@ def _auto_select_fit(
 
     if cov_poly <= cov_bspline:
         logger.info(
-            "bias_field_correction auto: selected 'poly' "
-            "(CoV %.4f vs bspline %.4f)",
+            "bias_field_correction auto: selected 'poly' " "(CoV %.4f vs bspline %.4f)",
             cov_poly,
             cov_bspline,
         )
         return log_bias_poly
 
     logger.info(
-        "bias_field_correction auto: selected 'bspline' "
-        "(CoV %.4f vs poly %.4f)",
+        "bias_field_correction auto: selected 'bspline' " "(CoV %.4f vs poly %.4f)",
         cov_bspline,
         cov_poly,
     )
@@ -1099,16 +1075,14 @@ def bias_field_correction(
             gradient_weighting=gradient_weighting,
         )
     else:
-        raise ValueError(
-            f"method must be 'poly', 'bspline', or 'auto', got '{method}'"
-        )
+        raise ValueError(f"method must be 'poly', 'bspline', or 'auto', got '{method}'")
 
     if zero_background:
         log_bias[~mask] = 0.0
     bias_field = np.exp(log_bias)
-    corrected = applymask(
-        data.astype(np.float64) / bias_field[..., None], mask
-    ).astype(orig_dtype)
+    corrected = applymask(data.astype(np.float64) / bias_field[..., None], mask).astype(
+        orig_dtype
+    )
 
     if return_bias_field:
         return corrected, bias_field

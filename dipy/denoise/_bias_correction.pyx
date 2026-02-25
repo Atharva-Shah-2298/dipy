@@ -66,7 +66,7 @@ cdef void _bspline_1d_values(
 
 def masked_voxel_coords(
     unsigned char[:, :, ::1] mask,
-    long[:, ::1] out,
+    cnp.int64_t[:, ::1] out,
 ):
     """Extract (i, j, k) voxel coordinates of all nonzero mask entries.
 
@@ -105,9 +105,9 @@ def masked_voxel_coords(
 
 def evaluate_bspline_rows(
     double[:, ::1] grid_coords,
-    long[::1] n_ctrl,
-    long[::1] row_ptr,
-    long[::1] col_idx,
+    cnp.int64_t[::1] n_ctrl,
+    cnp.int64_t[::1] row_ptr,
+    cnp.int64_t[::1] col_idx,
     double[::1] values,
 ):
     """Evaluate cubic B-spline basis for N masked voxels, filling CSR arrays.
