@@ -2719,11 +2719,12 @@ def ls_fit_dki(
         Inverse of the design matrix.
     return_S0_hat : bool, optional
         Boolean to return (True) or not (False) the S0 values for the fit.
-    weights : array ([X, Y, Z, ...], g), optional
-        Weights to apply for fitting. These weights must correspond to the
-        squared residuals such that $S = \sum_i w_i r_i^2$. If not provided,
+    weights : bool or array-like, shape (g,), optional
+        Parameter indicating whether per-voxel weights are used. If True,
         weights are estimated as the squared predicted signal from an initial
-        OLS fit.
+        OLS fit. If an array is provided, these weights must correspond to the
+        squared residuals such that $S = \sum_i w_i r_i^2$ for the g
+        measurements of the current voxel. If False, no weights are used.
     min_diffusivity : float, optional
         Because negative eigenvalues are not physical and small eigenvalues,
         much smaller than the diffusion weighting, cause quite a lot of noise
@@ -2830,13 +2831,12 @@ def cls_fit_dki(
         problem.
     return_S0_hat : bool, optional
         Boolean to return (True) or not (False) the S0 values for the fit.
-    weights : array ([X, Y, Z, ...], g), optional
-        Weights to apply for fitting. These weights must correspond to the
-        squared residuals such that $S = \sum_i w_i r_i^2$. If not provided,
+    weights : bool or array-like, shape (g,), optional
+        Parameter indicating whether per-voxel weights are used. If True,
         weights are estimated as the squared predicted signal from an initial
-        OLS fit.
-    weights : bool, optional
-        Parameter indicating whether weights are used.
+        OLS fit. If an array is provided, these weights must correspond to the
+        squared residuals such that $S = \sum_i w_i r_i^2$ for the g
+        measurements of the current voxel. If False, no weights are used.
     min_diffusivity : float, optional
         Because negative eigenvalues are not physical and small eigenvalues,
         much smaller than the diffusion weighting, cause quite a lot of noise
