@@ -1,5 +1,6 @@
 cython_sources = [
   'dirspeed',
+  'dkispeed',
   'eudx_direction_getter',
   'quick_squash',
   'recspeed',
@@ -9,6 +10,7 @@ cython_sources = [
 cython_headers = [
   '_force_heap.pxd',
   '_force_search.pxd',
+  'dkispeed.pxd',
   'recspeed.pxd',
   ]
 

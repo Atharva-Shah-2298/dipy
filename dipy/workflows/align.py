@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+import shutil
 from warnings import warn
 
 import numpy as np
@@ -151,10 +153,24 @@ class ResliceFlow(Workflow):
                 )
                 source_file = Path(inputfile)
                 link_file = Path(outpfile)
+                if link_file.exists() and link_file.resolve() == source_file.resolve():
+                    logger.debug(f"{outpfile} already linked/copied. Skipping.")
+                    continue
+                if link_file.exists() or link_file.is_symlink():
+                    link_file.unlink()
                 try:
                     link_file.symlink_to(source_file.resolve())
                 except OSError:
-                    logger.error(f"Symlink {outpfile} creation failed")
+                    # Symlinks may need elevated privileges on Windows; try a hard
+                    # link before falling back to copying large volumes.
+                    try:
+                        os.link(source_file, link_file)
+                        logger.info(f"Hard link created for {outpfile}")
+                    except OSError:
+                        shutil.copy(source_file, link_file)
+                        logger.warning(
+                            f"Link creation for {outpfile} failed, copied instead."
+                        )
                 continue
             else:
                 new_data, new_affine = reslice(
@@ -189,6 +205,7 @@ class SlrWithQbxFlow(Workflow):
         nb_pts=20,
         progressive=True,
         bbox_valid_check=True,
+        remove_invalid_streamlines=False,
         out_dir="",
         out_moved="moved.trx",
         out_affine="affine.txt",
@@ -236,6 +253,10 @@ class SlrWithQbxFlow(Workflow):
         bbox_valid_check : boolean, optional
             Verification for negative voxel coordinates or values above the volume
             dimensions.
+        remove_invalid_streamlines : bool, optional
+            If True, streamlines outside the volume bounding box are removed
+            before saving. When enabled, ``bbox_valid_check`` is automatically
+            set to False.
         out_dir : string, optional
             Output directory.
         out_moved : string, optional
@@ -319,8 +340,12 @@ class SlrWithQbxFlow(Workflow):
                 moving_obj,
                 moving_obj.space,
             )
+            if remove_invalid_streamlines:
+                new_tractogram.remove_invalid_streamlines()
             save_tractogram(
-                new_tractogram, str(out_moved_file), bbox_valid_check=bbox_valid_check
+                new_tractogram,
+                str(out_moved_file),
+                bbox_valid_check=bbox_valid_check and not remove_invalid_streamlines,
             )
 
             logger.info(f"Saving output file {out_affine_file}")
@@ -332,10 +357,12 @@ class SlrWithQbxFlow(Workflow):
                 moving_obj,
                 moving_obj.space,
             )
+            if remove_invalid_streamlines:
+                new_tractogram.remove_invalid_streamlines()
             save_tractogram(
                 new_tractogram,
                 str(static_centroids_file),
-                bbox_valid_check=bbox_valid_check,
+                bbox_valid_check=bbox_valid_check and not remove_invalid_streamlines,
             )
 
             logger.info(f"Saving output file {moving_centroids_file}")
@@ -344,10 +371,12 @@ class SlrWithQbxFlow(Workflow):
                 moving_obj,
                 moving_obj.space,
             )
+            if remove_invalid_streamlines:
+                new_tractogram.remove_invalid_streamlines()
             save_tractogram(
                 new_tractogram,
                 str(moving_centroids_file),
-                bbox_valid_check=bbox_valid_check,
+                bbox_valid_check=bbox_valid_check and not remove_invalid_streamlines,
             )
 
             centroids_moved = transform_streamlines(centroids_moving, affine)
@@ -359,10 +388,12 @@ class SlrWithQbxFlow(Workflow):
                 moving_obj,
                 moving_obj.space,
             )
+            if remove_invalid_streamlines:
+                new_tractogram.remove_invalid_streamlines()
             save_tractogram(
                 new_tractogram,
                 str(moved_centroids_file),
-                bbox_valid_check=bbox_valid_check,
+                bbox_valid_check=bbox_valid_check and not remove_invalid_streamlines,
             )
 
 

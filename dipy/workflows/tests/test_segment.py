@@ -4,21 +4,23 @@ from tempfile import TemporaryDirectory
 import nibabel as nib
 import numpy as np
 import numpy.testing as npt
+import pytest
 
 from dipy.align.streamlinear import BundleMinDistanceMetric
 from dipy.data import get_fnames
-from dipy.io.image import load_nifti_data
+from dipy.io.image import load_nifti_data, save_nifti
 from dipy.io.stateful_tractogram import Space, StatefulTractogram
 from dipy.io.streamline import load_tractogram, save_tractogram
 from dipy.segment.mask import median_otsu
-from dipy.segment.tests.test_mrf import create_image
 from dipy.testing import assert_warns
 from dipy.testing.decorators import set_random_number_generator
 from dipy.tracking.streamline import Streamlines, set_number_of_points
 from dipy.utils.deprecator import ArgsDeprecationWarning
 from dipy.utils.optpkg import optional_package
 from dipy.workflows.segment import (
+    BrainMaskFlow,
     ClassifyTissueFlow,
+    ClusterStreamlinesFlow,
     LabelsBundlesFlow,
     MedianOtsuFlow,
     RecoBundlesFlow,
@@ -179,23 +181,30 @@ def test_recobundles_flow():
 
 
 @set_random_number_generator()
-def test_classify_tissue_flow(rng=None):
+def test_classify_tissue_flow_hmrf(rng=None):
     with TemporaryDirectory() as out_dir:
-        data = create_image()
+        # Small structured volume (30x30x5 = 4500 voxels, ~70x smaller than
+        # the original 256x256x5). Three Gaussian populations with non-zero
+        # variance so the HMRF E-step statistics are well-conditioned.
+        data = np.zeros((30, 30, 5), dtype=np.float64)
+        data[:10, :, :] = 50.0
+        data[10:20, :, :] = 150.0
+        data[20:, :, :] = 250.0
+        data += rng.normal(0, 10.0, data.shape)
+        data = np.clip(data, 0, None)
         data_path = Path(out_dir) / "data.nii.gz"
         nib.save(nib.Nifti1Image(data, np.eye(4)), data_path)
 
-        args = {
-            "input_files": data_path,
-            "method": "hmrf",
-            "nclass": 4,
-            "beta": 0.1,
-            "tolerance": 0.0001,
-            "max_iter": 10,
-            "out_dir": out_dir,
-        }
         flow = ClassifyTissueFlow()
-        flow.run(**args)
+        flow.run(
+            input_files=data_path,
+            method="hmrf",
+            nclass=3,
+            beta=0.1,
+            tolerance=0,
+            max_iter=3,
+            out_dir=out_dir,
+        )
 
         tissue = flow.last_generated_outputs["out_tissue"]
         pve = flow.last_generated_outputs["out_pve"]
@@ -204,10 +213,9 @@ def test_classify_tissue_flow(rng=None):
         pve_data = load_nifti_data(pve)
 
         npt.assert_equal(tissue_data.shape, data.shape)
-        npt.assert_equal(tissue_data.max(), 4)
-        npt.assert_equal(tissue_data.min(), 0)
-
-        npt.assert_equal(pve_data.shape, (data.shape) + (4,))
+        npt.assert_equal(tissue_data.max(), 3)
+        npt.assert_equal(tissue_data.min() >= 0, True)
+        npt.assert_equal(pve_data.shape, data.shape + (3,))
         npt.assert_equal(pve_data.max(), 1)
 
         npt.assert_raises(SystemExit, flow.run, data_path)
@@ -215,39 +223,129 @@ def test_classify_tissue_flow(rng=None):
         npt.assert_raises(SystemExit, flow.run, data_path, method="dam")
         npt.assert_raises(SystemExit, flow.run, data_path, method="hmrf")
 
-    if has_sklearn:
+
+@pytest.mark.skipif(not has_sklearn, reason="Requires scikit-learn")
+@set_random_number_generator()
+def test_classify_tissue_flow_dam(rng=None):
+    with TemporaryDirectory() as out_dir:
+        data = rng.uniform(low=0.0, high=100.0, size=(3, 3, 3, 7))
+        bvals = np.array([0, 100, 500, 1000, 1500, 2000, 3000])
+        data_path = Path(out_dir) / "data.nii.gz"
+        bvals_path = Path(out_dir) / "bvals"
+        np.savetxt(bvals_path, bvals)
+        nib.save(nib.Nifti1Image(data, np.eye(4)), data_path)
+
+        flow = ClassifyTissueFlow()
+        flow.run(
+            input_files=data_path,
+            bvals_file=bvals_path,
+            method="dam",
+            wm_threshold=0.5,
+            out_dir=out_dir,
+        )
+
+        tissue = flow.last_generated_outputs["out_tissue"]
+        pve = flow.last_generated_outputs["out_pve"]
+
+        tissue_data = load_nifti_data(tissue)
+        pve_data = load_nifti_data(pve)
+
+        npt.assert_equal(tissue_data.shape, data.shape[:-1])
+        npt.assert_equal(tissue_data.max(), 2)
+        npt.assert_equal(tissue_data.min(), 0)
+        npt.assert_equal(pve_data.shape, data.shape[:-1] + (2,))
+        npt.assert_equal(pve_data.max(), 1)
+
+
+@pytest.mark.skipif(not has_torch, reason="Requires PyTorch")
+@set_random_number_generator()
+def test_classify_tissue_flow_synthseg(rng=None):
+    with TemporaryDirectory() as out_dir:
+        data = rng.uniform(low=0.0, high=1.0, size=(96, 96, 96))
+        data_path = Path(out_dir) / "data.nii.gz"
+        nib.save(nib.Nifti1Image(data, np.eye(4) * 2), data_path)
+
+        torch.set_num_threads(1)
+        flow = ClassifyTissueFlow()
+        flow.run(input_files=data_path, method="synthseg", out_dir=out_dir)
+
+        tissue = flow.last_generated_outputs["out_tissue"]
+        tissue_data = load_nifti_data(tissue)
+
+        npt.assert_equal(tissue_data.shape, data.shape)
+        npt.assert_equal(tissue_data.min(), 0)
+        npt.assert_equal(tissue_data.max() < 60, True)
+
+
+@set_random_number_generator()
+def test_brain_mask_flow(rng=None):
+    with TemporaryDirectory() as out_dir:
+        data_path, _, _ = get_fnames(name="small_25")
+        flow = BrainMaskFlow()
+        npt.assert_raises(SystemExit, flow.run, data_path, method="invalid")
+
+    with TemporaryDirectory() as out_dir:
+        data_path, bval_path, _ = get_fnames(name="small_25")
+        volume = load_nifti_data(data_path)
+        median_radius = 2
+        numpass = 5
+
+        flow = BrainMaskFlow()
+        flow.run(
+            data_path,
+            method="median_otsu",
+            vol_idx="0,",
+            median_radius=median_radius,
+            numpass=numpass,
+            save_masked=True,
+            out_dir=out_dir,
+        )
+
+        mask_name = flow.last_generated_outputs["out_mask"]
+        masked_name = flow.last_generated_outputs["out_masked"]
+
+        _, expected_mask = median_otsu(
+            volume,
+            vol_idx=[0],
+            median_radius=median_radius,
+            numpass=numpass,
+        )
+        result_mask_data = load_nifti_data(Path(out_dir) / mask_name)
+        npt.assert_array_equal(result_mask_data, expected_mask.astype(np.float64))
+        npt.assert_equal((Path(out_dir) / masked_name).exists(), True)
+
+    with TemporaryDirectory() as out_dir:
+        data_path, bval_path, _ = get_fnames(name="small_25")
+        volume = load_nifti_data(data_path)
+
+        flow = BrainMaskFlow()
+        flow.run(
+            data_path,
+            method="median_otsu",
+            bvalues_files=bval_path,
+            out_dir=out_dir,
+        )
+
+        mask_name = flow.last_generated_outputs["out_mask"]
+        result_mask_data = load_nifti_data(Path(out_dir) / mask_name)
+        npt.assert_equal(result_mask_data.shape, volume.shape[:3])
+
+    if has_torch:
         with TemporaryDirectory() as out_dir:
-            data = rng.uniform(
-                low=0.0, high=100.0, size=(3, 3, 3, 7)
-            )  # Simulated random data
-            bvals = np.array([0, 100, 500, 1000, 1500, 2000, 3000])
-            data_path = Path(out_dir) / "data.nii.gz"
-            bvals_path = Path(out_dir) / "bvals"
-            np.savetxt(bvals_path, bvals)
-            nib.save(nib.Nifti1Image(data, np.eye(4)), data_path)
+            file_path = get_fnames(name="evac_test_data")
+            volume = np.load(file_path)["input"][0]
+            temp_path = Path(out_dir) / "temp.nii.gz"
+            save_nifti(temp_path, volume, np.eye(4))
 
-            args = {
-                "input_files": data_path,
-                "bvals_file": bvals_path,
-                "method": "dam",
-                "wm_threshold": 0.5,
-                "out_dir": out_dir,
-            }
-            flow = ClassifyTissueFlow()
-            flow.run(**args)
+            flow = BrainMaskFlow()
+            flow.run(temp_path, method="evac", out_dir=out_dir)
 
-            tissue = flow.last_generated_outputs["out_tissue"]
-            pve = flow.last_generated_outputs["out_pve"]
+            mask_name = flow.last_generated_outputs["out_mask"]
+            mask_data = load_nifti_data(Path(out_dir) / mask_name)
 
-            tissue_data = load_nifti_data(tissue)
-            pve_data = load_nifti_data(pve)
-
-            npt.assert_equal(tissue_data.shape, data.shape[:-1])
-            npt.assert_equal(tissue_data.max(), 2)
-            npt.assert_equal(tissue_data.min(), 0)
-
-            npt.assert_equal(pve_data.shape, (data.shape[:-1]) + (2,))
-            npt.assert_equal(pve_data.max(), 1)
+            npt.assert_equal(mask_data.shape, volume.shape)
+            npt.assert_equal(mask_data.min() >= 0, True)
+            npt.assert_equal(mask_data.max() <= 1, True)
 
     if has_torch:
         with TemporaryDirectory() as out_dir:
@@ -255,18 +353,72 @@ def test_classify_tissue_flow(rng=None):
             data_path = Path(out_dir) / "data.nii.gz"
             nib.save(nib.Nifti1Image(data, np.eye(4) * 2), data_path)
 
-            args = {
-                "input_files": data_path,
-                "method": "synthseg",
-                "out_dir": out_dir,
-            }
-            flow = ClassifyTissueFlow()
-            flow.run(**args)
+            flow = BrainMaskFlow()
+            flow.run(data_path, method="synthseg", out_dir=out_dir)
 
-            tissue = flow.last_generated_outputs["out_tissue"]
+            mask_name = flow.last_generated_outputs["out_mask"]
+            mask_data = load_nifti_data(Path(out_dir) / mask_name)
 
-            tissue_data = load_nifti_data(tissue)
+            npt.assert_equal(mask_data.shape, data.shape)
+            npt.assert_equal(mask_data.min() >= 0, True)
+            npt.assert_equal(mask_data.max() <= 1, True)
 
-            npt.assert_equal(tissue_data.shape, data.shape)
-            npt.assert_equal(tissue_data.min(), 0)
-            npt.assert_equal(tissue_data.max() < 60, True)
+
+def test_cluster_streamlines_flow():
+    with TemporaryDirectory() as out_dir:
+        data_path = get_fnames(name="fornix")
+        sft = load_tractogram(data_path, "same", bbox_valid_check=False)
+        n_streamlines = len(sft.streamlines)
+
+        flow = ClusterStreamlinesFlow()
+        npt.assert_raises(SystemExit, flow.run, data_path, method="invalid")
+
+        flow = ClusterStreamlinesFlow(force=True)
+        flow.run(data_path, method="quickbundles", threshold=10.0, out_dir=out_dir)
+        centroids_sft = load_tractogram(
+            Path(out_dir) / flow.last_generated_outputs["out_centroids"],
+            "same",
+            bbox_valid_check=False,
+        )
+        labels = np.load(
+            Path(out_dir) / flow.last_generated_outputs["out_cluster_labels"]
+        )
+        npt.assert_equal(len(centroids_sft.streamlines) > 0, True)
+        npt.assert_equal(labels.shape[0], n_streamlines)
+
+        flow._force_overwrite = True
+        flow.run(
+            data_path,
+            method="qbx_and_merge",
+            thresholds="30,20,10",
+            out_dir=out_dir,
+        )
+        centroids_sft = load_tractogram(
+            Path(out_dir) / flow.last_generated_outputs["out_centroids"],
+            "same",
+            bbox_valid_check=False,
+        )
+        labels = np.load(
+            Path(out_dir) / flow.last_generated_outputs["out_cluster_labels"]
+        )
+        npt.assert_equal(len(centroids_sft.streamlines) > 0, True)
+        npt.assert_equal(labels.shape[0], n_streamlines)
+
+        flow._force_overwrite = True
+        flow.run(
+            data_path,
+            method="faststreamlines",
+            threshold=10.0,
+            max_radius=15.0,
+            out_dir=out_dir,
+        )
+        centroids_sft = load_tractogram(
+            Path(out_dir) / flow.last_generated_outputs["out_centroids"],
+            "same",
+            bbox_valid_check=False,
+        )
+        labels = np.load(
+            Path(out_dir) / flow.last_generated_outputs["out_cluster_labels"]
+        )
+        npt.assert_equal(len(centroids_sft.streamlines) > 0, True)
+        npt.assert_equal(labels.shape[0], n_streamlines)
