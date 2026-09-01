@@ -13,5 +13,6 @@ DIPY User Guide
    installation
    dependencies
    getting_started
+   workshop_handbook
    data
    bibliography
