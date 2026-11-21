@@ -110,6 +110,67 @@ model.generate(
 
 ###############################################################################
 #
+# Optional: accounting for the echo and repetition time
+# -----------------------------------------------------
+#
+# By default FORCE simulates pure diffusion attenuation, so the WM, GM and CSF
+# fractions it reports are fractions of the *measured signal*. That signal is
+# also $T_2$ and $T_1$ weighted: at a long echo time (TE) the short-$T_2$
+# tissue signal has decayed much more than the CSF signal, and the same voxel
+# is matched to a larger CSF fraction.
+#
+# If the acquisition timing is known, the library can be simulated for that
+# acquisition instead. Each compartment signal is multiplied by its spin-echo
+# relaxation weight *before* the compartments are mixed,
+#
+# .. math::
+#
+#     S = S_0 \sum_c f_c \, (1 - e^{-TR/T_{1,c}}) \, e^{-TE/T_{2,c}} \, E_c(b, g)
+#
+# This is opt-in and uses seconds, as BIDS does::
+#
+#     model = FORCEModel(gtab, te=0.0895, tr=5.52, relaxation_model="tissue")
+#     model.generate(num_simulations=500000)
+#     model.relaxation_applied   # True
+#
+# Without ``relaxation_model="tissue"`` nothing changes, whether or not ``te``
+# and ``tr`` are given. No timing value is ever assumed. With ``te`` but no
+# ``tr`` only the $T_2$ weighting is applied, which leaves the $T_1$
+# saturation of CSF unmodeled and underestimates the CSF fraction at short
+# TR. Without ``te`` the original library is used: correcting $T_1$ alone
+# would move the simulated signals away from the measured ones. Both cases
+# issue a warning.
+#
+# ``dipy.io.bids.read_te_tr`` collects the timing from explicit values, the
+# ``EchoTime`` / ``RepetitionTime`` of a BIDS JSON sidecar, or (TR only) a
+# NIfTI header that declares its time unit. On the command line,
+# ``dipy_fit_force ... --relaxation_model tissue`` does the same.
+#
+# Sampled microstructure, priors, matching and outputs are untouched, and no
+# parameter is added. What changes is the meaning of the tissue fractions:
+# they become volume fractions under the assumed relaxation times instead of
+# signal fractions. Those times are fixed per tissue, not fitted. The defaults
+# are for human brain at 3 T :footcite:p:`Wansapura1999`, :footcite:p:`Lu2005`,
+# :footcite:p:`Spijkerman2018` and can be replaced, for instance to give the
+# intra- and extra-axonal compartments distinct $T_2$
+# :footcite:p:`Veraart2018`::
+#
+#     model = FORCEModel(
+#         gtab,
+#         te=0.0895,
+#         relaxation_model="tissue",
+#         relaxation_params={
+#             "wm_intra": {"t2": 0.090},
+#             "wm_extra": {"t2": 0.060},
+#         },
+#     )
+#
+# The weighting assumes a spin-echo sequence with $TE \ll TR$ and ignores
+# proton-density differences between tissues. Relaxation-aware libraries are
+# cached separately from original ones.
+
+###############################################################################
+#
 # Using a different signal model
 # ------------------------------
 #

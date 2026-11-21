@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import warnings
 
 import numpy as np
 
@@ -43,6 +44,293 @@ from dipy.utils.multiproc import determine_num_processes
 DEFAULT_ODI_RANGE = (0.01, 0.3)
 DEFAULT_NUM_ODI_VALUES = 10
 DEFAULT_FORCE_SEED = 2298
+
+# Optional TE/TR-aware simulation -------------------------------------------
+# Relaxation models understood by ``resolve_relaxation``.
+RELAXATION_MODELS = ("tissue",)
+# Order of the relaxation weights handed to the Cython simulator.
+RELAXATION_COMPARTMENTS = ("wm_intra", "wm_extra", "gm", "csf")
+# Default relaxation times in SECONDS for human brain at 3 T. They are kept
+# separate from the diffusivity/microstructure priors and are not fitted.
+#   wm/gm t1 : in vivo at 3 T (Wansapura et al. 1999).
+#   wm/gm t2 : in vivo CPMG at 3 T, mean of frontal and occipital regions
+#              (Lu et al. 2005).
+#   csf t1   : in vivo inversion recovery at 3 T (Lu et al. 2005).
+#   csf t2   : in vivo ventricular CSF at 3 T (Spijkerman et al. 2018).
+DEFAULT_RELAXATION_PARAMS = {
+    "wm": {"t1": 0.832, "t2": 0.075},
+    "gm": {"t1": 1.331, "t2": 0.083},
+    "csf": {"t1": 3.817, "t2": 2.03},
+}
+# Upper plausibility bounds in seconds. A value above its bound is almost
+# certainly expressed in milliseconds and is rejected instead of rescaled.
+_MAX_TE = 1.0
+_MAX_TR = 100.0
+_MAX_RELAXATION_TIME = 10.0
+
+
+def _check_seconds(name, value, upper):
+    """Return ``value`` as a float after checking it is a time in seconds.
+
+    Parameters
+    ----------
+    name : str
+        Name used in error messages.
+    value : float
+        Time in seconds.
+    upper : float
+        Largest plausible value in seconds.
+
+    Returns
+    -------
+    value : float
+        Validated time in seconds.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{name} must be a number in seconds, got {value!r}") from e
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive and finite, got {value}")
+    if value > upper:
+        raise ValueError(
+            f"{name}={value:g} is not plausible in seconds (expected <= "
+            f"{upper:g} s). FORCE expects seconds, as in BIDS; a value in "
+            f"milliseconds must be divided by 1000, e.g. {value / 1000:g}."
+        )
+    return value
+
+
+def validate_te_tr(*, te=None, tr=None):
+    """Validate echo and repetition times given in seconds.
+
+    Parameters
+    ----------
+    te : float or None, optional
+        Echo time in seconds.
+    tr : float or None, optional
+        Repetition time in seconds.
+
+    Returns
+    -------
+    te : float or None
+        Validated echo time in seconds.
+    tr : float or None
+        Validated repetition time in seconds.
+
+    Raises
+    ------
+    ValueError
+        If a value is not positive and finite, looks like milliseconds, or
+        if ``te >= tr``.
+    """
+    if te is not None:
+        te = _check_seconds("te", te, _MAX_TE)
+    if tr is not None:
+        tr = _check_seconds("tr", tr, _MAX_TR)
+    if te is not None and tr is not None and te >= tr:
+        raise ValueError(f"te ({te:g} s) must be shorter than tr ({tr:g} s)")
+    return te, tr
+
+
+def get_default_relaxation_params():
+    """Get the default compartment relaxation times.
+
+    Returns
+    -------
+    params : dict
+        ``{"wm": {"t1", "t2"}, "gm": {...}, "csf": {...}}`` in seconds, for
+        human brain at 3 T :footcite:p:`Wansapura1999`, :footcite:p:`Lu2005`,
+        :footcite:p:`Spijkerman2018`.
+
+    References
+    ----------
+    .. footbibliography::
+    """
+    return {k: dict(v) for k, v in DEFAULT_RELAXATION_PARAMS.items()}
+
+
+def validate_relaxation_params(params):
+    """Validate relaxation times and expand them to the FORCE compartments.
+
+    Parameters
+    ----------
+    params : dict or None
+        Relaxation times in seconds, keyed by ``"wm"``, ``"gm"``, ``"csf"``
+        and optionally ``"wm_intra"`` / ``"wm_extra"``, each a dict with
+        ``"t1"`` and/or ``"t2"``. Missing entries fall back to
+        :func:`get_default_relaxation_params`; ``"wm_intra"`` and
+        ``"wm_extra"`` fall back to ``"wm"``. ``None`` gives the defaults.
+
+    Returns
+    -------
+    resolved : dict
+        ``{compartment: {"t1": float, "t2": float}}`` for each of
+        ``RELAXATION_COMPARTMENTS``.
+
+    Raises
+    ------
+    ValueError
+        On unknown keys, non-positive values, values that look like
+        milliseconds, or ``t2 > t1``.
+    """
+    params = {} if params is None else params
+    allowed = {"wm", "gm", "csf", "wm_intra", "wm_extra"}
+    unknown = set(params) - allowed
+    if unknown:
+        raise ValueError(
+            f"Unknown relaxation compartment(s) {sorted(unknown)}; "
+            f"expected a subset of {sorted(allowed)}"
+        )
+    for name, times in params.items():
+        extra = set(times) - {"t1", "t2"}
+        if extra:
+            raise ValueError(
+                f"Unknown relaxation key(s) {sorted(extra)} for '{name}'; "
+                "expected 't1' and/or 't2'"
+            )
+
+    resolved = {}
+    for name in RELAXATION_COMPARTMENTS:
+        tissue = "wm" if name.startswith("wm") else name
+        times = dict(DEFAULT_RELAXATION_PARAMS[tissue])
+        times.update(params.get(tissue, {}))
+        times.update(params.get(name, {}))
+        t1 = _check_seconds(f"{name} t1", times["t1"], _MAX_RELAXATION_TIME)
+        t2 = _check_seconds(f"{name} t2", times["t2"], _MAX_RELAXATION_TIME)
+        if t2 > t1:
+            raise ValueError(f"{name}: t2 ({t2:g} s) cannot exceed t1 ({t1:g} s)")
+        resolved[name] = {"t1": t1, "t2": t2}
+    return resolved
+
+
+def relaxation_weights(*, te=None, tr=None, relaxation_params=None):
+    r"""Spin-echo relaxation weight of each FORCE compartment.
+
+    For compartment $c$ the weight is
+
+    .. math::
+
+        R_c(TE, TR) = \left(1 - e^{-TR / T_{1,c}}\right) e^{-TE / T_{2,c}}
+
+    A missing ``te`` drops the $T_2$ factor and a missing ``tr`` drops the
+    $T_1$ factor: no acquisition value is assumed. This function only
+    evaluates the weights; :func:`resolve_relaxation` decides whether a
+    partial set of weights should be used for simulation.
+
+    Parameters
+    ----------
+    te : float or None, optional
+        Echo time in seconds.
+    tr : float or None, optional
+        Repetition time in seconds.
+    relaxation_params : dict or None, optional
+        Relaxation times in seconds, see :func:`validate_relaxation_params`.
+
+    Returns
+    -------
+    weights : ndarray (4,)
+        Weights ordered as ``RELAXATION_COMPARTMENTS``
+        (``wm_intra``, ``wm_extra``, ``gm``, ``csf``).
+
+    Notes
+    -----
+    The $T_1$ factor is the long-TR spin-echo approximation, valid for
+    $TE \ll TR$. Proton-density differences between compartments are not
+    modeled.
+    """
+    te, tr = validate_te_tr(te=te, tr=tr)
+    params = validate_relaxation_params(relaxation_params)
+    weights = np.ones(len(RELAXATION_COMPARTMENTS), dtype=np.float64)
+    for i, name in enumerate(RELAXATION_COMPARTMENTS):
+        if te is not None:
+            weights[i] *= np.exp(-te / params[name]["t2"])
+        if tr is not None:
+            weights[i] *= 1.0 - np.exp(-tr / params[name]["t1"])
+    return weights
+
+
+def resolve_relaxation(
+    *, te=None, tr=None, relaxation_model=None, relaxation_params=None
+):
+    """Decide whether and how relaxation weighting is applied.
+
+    Parameters
+    ----------
+    te : float or None, optional
+        Echo time in seconds.
+    tr : float or None, optional
+        Repetition time in seconds.
+    relaxation_model : str or None, optional
+        ``None`` disables relaxation weighting, whatever ``te`` and ``tr``
+        are. ``"tissue"`` weights the WM, GM and CSF compartment signals by
+        :func:`relaxation_weights`.
+    relaxation_params : dict or None, optional
+        Relaxation times in seconds, see :func:`validate_relaxation_params`.
+
+    Returns
+    -------
+    relaxation : dict or None
+        ``None`` when the original FORCE simulation applies: the model is
+        disabled, or it is enabled but ``te`` is unknown (a ``UserWarning``
+        is issued in that case). Otherwise a dict with ``"model"``,
+        ``"te"``, ``"tr"``, ``"terms"`` (the applied factors, ``("t2",)`` or
+        ``("t2", "t1")``), ``"params"`` and ``"weights"``.
+
+    Notes
+    -----
+    Incomplete timing is handled as follows.
+
+    * ``te`` only: the $T_2$ weighting is applied and a ``UserWarning``
+      states that $T_1$ saturation is not modeled. Long-$T_1$ CSF is then
+      treated as fully recovered and its fraction is underestimated; the
+      effect shrinks as TR grows.
+    * ``tr`` only: nothing is applied. In brain tissue the $T_1$ factor
+      attenuates CSF while the unmodeled $T_2$ factor favors it by a larger
+      amount, so a $T_1$-only correction moves the simulated signals away
+      from the measured ones.
+    """
+    if relaxation_model is None:
+        return None
+    if relaxation_model not in RELAXATION_MODELS:
+        raise ValueError(
+            f"relaxation_model must be None or one of {RELAXATION_MODELS}, "
+            f"got {relaxation_model!r}"
+        )
+    te, tr = validate_te_tr(te=te, tr=tr)
+    params = validate_relaxation_params(relaxation_params)
+    if te is None:
+        reason = (
+            "neither te nor tr is available"
+            if tr is None
+            else "te is not available and a T1-only (tr) correction would "
+            "increase the mismatch with the measured signal"
+        )
+        warnings.warn(
+            f"relaxation_model={relaxation_model!r} was requested but "
+            f"{reason}. No relaxation weighting is applied and the original "
+            "FORCE simulation is used.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return None
+    if tr is None:
+        warnings.warn(
+            "tr is not available: only the T2 (te) weighting is applied. "
+            "T1 saturation is not modeled, so the CSF fraction is "
+            "underestimated unless tr is much longer than the CSF T1.",
+            UserWarning,
+            stacklevel=3,
+        )
+    terms = ("t2",) if tr is None else ("t2", "t1")
+    return {
+        "model": relaxation_model,
+        "te": te,
+        "tr": tr,
+        "terms": terms,
+        "params": params,
+        "weights": relaxation_weights(te=te, tr=tr, relaxation_params=params),
+    }
 
 
 @warning_for_keywords(from_version="1.13.0")
@@ -193,6 +481,7 @@ def _generate_batch_worker(
     memmap_info,
     diffusivity_cfg,
     min_crossing_angles,
+    relaxation_weights=None,
 ):
     """Worker function for parallel batch generation."""
     from dipy.sims._force_core import create_mixed_signal, set_diffusivity_ranges
@@ -329,6 +618,7 @@ def _generate_batch_worker(
             tort,
             min_crossing_angles[0],
             min_crossing_angles[1],
+            relaxation_weights,
         )
         (
             signals_mm[idx],
@@ -445,6 +735,10 @@ def generate_force_simulations(
     compute_dti=True,
     compute_dki=False,
     verbose=True,
+    te=None,
+    tr=None,
+    relaxation_model=None,
+    relaxation_params=None,
 ):
     """Generate FORCE simulations.
 
@@ -500,6 +794,24 @@ def generate_force_simulations(
         Compute DKI metrics (AK, RK, MK, KFA).
     verbose : bool, optional
         Enable progress output.
+    te : float or None, optional
+        Echo time in seconds. Only used when ``relaxation_model`` is set.
+    tr : float or None, optional
+        Repetition time in seconds. Only used when ``relaxation_model`` is
+        set.
+    relaxation_model : str or None, optional
+        ``None`` (default) generates the original FORCE library. ``"tissue"``
+        multiplies every compartment signal by its spin-echo relaxation
+        weight (see :func:`relaxation_weights`) before the compartments are
+        mixed. The sampled microstructure, and therefore every stored
+        parameter except the signals and the signal-derived DTI/DKI metrics,
+        is identical to the original library for the same seed. If neither
+        ``te`` nor ``tr`` is given the original library is generated and a
+        warning is issued.
+    relaxation_params : dict or None, optional
+        Compartment relaxation times in seconds, see
+        :func:`validate_relaxation_params`. Defaults to
+        :func:`get_default_relaxation_params`.
 
     Returns
     -------
@@ -538,6 +850,14 @@ def generate_force_simulations(
         if not 0 <= angle < 90:
             raise ValueError(f"{name} must be in [0, 90) degrees, got {angle}")
     min_crossing_angles = (float(two_fiber_min_angle), float(three_fiber_min_angle))
+
+    relaxation = resolve_relaxation(
+        te=te,
+        tr=tr,
+        relaxation_model=relaxation_model,
+        relaxation_params=relaxation_params,
+    )
+    relaxation_w = None if relaxation is None else relaxation["weights"]
 
     # Setup sphere and ODI values
     sphere = default_sphere
@@ -715,6 +1035,7 @@ def generate_force_simulations(
                     memmap_info,
                     diffusivity_config,
                     min_crossing_angles,
+                    relaxation_w,
                 )
                 pbar.update(batch_done)
         finally:
@@ -748,6 +1069,7 @@ def generate_force_simulations(
                         memmap_info,
                         diffusivity_config,
                         min_crossing_angles,
+                        relaxation_w,
                     ): (start_idx, bs)
                     for start_idx, bs, batch_seed in batch_specs
                 }
@@ -789,6 +1111,7 @@ def generate_force_simulations(
                     memmap_info,
                     diffusivity_config,
                     min_crossing_angles,
+                    relaxation_w,
                 ): (start_idx, bs)
                 for start_idx, bs, batch_seed in batch_specs
             }
@@ -884,6 +1207,10 @@ def generate_force_simulations(
         "ufa_voxel": np.array(ufa_voxel_mm),
         "fraction_array": np.array(fraction_array_mm),
     }
+
+    # Provenance: present only in relaxation-aware libraries.
+    if relaxation_w is not None:
+        simulations["relaxation_weights"] = relaxation_w
 
     if compute_dki:
         simulations.update(

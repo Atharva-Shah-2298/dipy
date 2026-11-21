@@ -822,3 +822,67 @@ def test_reconst_odffp_invalid_interval(tmp_path):
             d_a=[2.5, 1.5],
             out_dir=str(tmp_path),
         )
+
+
+def test_reconst_force_relaxation_metadata(monkeypatch, tmp_path):
+    """TE/TR reach the model only when relaxation modeling is requested."""
+    import json
+    import shutil
+
+    data_path, bval_path, bvec_path = get_fnames(name="small_64D")
+    dwi_path = tmp_path / "dwi.nii"
+    shutil.copy(data_path, dwi_path)
+    volume, affine = load_nifti(dwi_path)
+    mask_path = tmp_path / "mask.nii.gz"
+    save_nifti(mask_path, np.ones(volume.shape[:3], dtype=np.uint8), affine)
+    bvals, _ = read_bvals_bvecs(bval_path, bvec_path)
+    fake_sims = _make_fake_simulations(len(bvals))
+
+    seen = []
+
+    def _fake_generate(self, **kwargs):
+        seen.append(self.relaxation)
+        self.simulations = fake_sims
+        self._prepare_library()
+        return self
+
+    monkeypatch.setattr("dipy.reconst.force.FORCEModel.generate", _fake_generate)
+
+    def run(**kwargs):
+        n_runs = len(seen)
+        ReconstForceFlow().run(
+            str(dwi_path),
+            str(bval_path),
+            str(bvec_path),
+            str(mask_path),
+            n_neighbors=5,
+            engine="serial",
+            save_metrics=["fa"],
+            out_dir=str(tmp_path / f"out{n_runs}"),
+            **kwargs,
+        )
+        assert len(seen) == n_runs + 1
+        return seen[-1]
+
+    sidecar = tmp_path / "dwi.json"
+    sidecar.write_text(json.dumps({"EchoTime": 0.09, "RepetitionTime": 6.0}))
+
+    # Default run: the sidecar is present but relaxation stays off.
+    assert run() is None
+    assert run(te=0.09, tr=6.0) is None
+
+    # Enabled: timing comes from the sidecar, explicit values override it.
+    relaxation = run(relaxation_model="tissue")
+    assert (relaxation["te"], relaxation["tr"]) == (0.09, 6.0)
+    relaxation = run(relaxation_model="tissue", te=0.12)
+    assert (relaxation["te"], relaxation["tr"]) == (0.12, 6.0)
+
+    # TR alone (header or sidecar) is not enough: original FORCE.
+    sidecar.write_text(json.dumps({"RepetitionTime": 6.0}))
+    with pytest.warns(UserWarning, match="te is not available"):
+        assert run(relaxation_model="tissue") is None
+
+    # Enabled without any metadata: original FORCE, with a warning.
+    sidecar.unlink()
+    with pytest.warns(UserWarning, match="neither te nor tr"):
+        assert run(relaxation_model="tissue") is None

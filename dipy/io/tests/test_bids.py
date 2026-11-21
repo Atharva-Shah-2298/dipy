@@ -20,6 +20,7 @@ from dipy.io.bids import (
     parse_entities,
     phase_encoding_info,
     read_sidecar,
+    read_te_tr,
     validate_dataset,
     write_dataset_description,
 )
@@ -665,3 +666,92 @@ def test_write_dataset_description_links():
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def _write_timed_nifti(path, *, tr, time_unit):
+    """Write a 4D image whose header stores ``tr`` in ``time_unit``."""
+    import nibabel as nib
+
+    img = nib.Nifti1Image(np.zeros((2, 2, 2, 4), dtype=np.float32), np.eye(4))
+    img.header.set_zooms((2.0, 2.0, 2.0, tr))
+    img.header.set_xyzt_units(xyz="mm", t=time_unit)
+    nib.save(img, str(path))
+
+
+def test_read_te_tr_sources_and_units(tmp_path):
+    """Explicit values, the sidecar and the header agree in seconds."""
+    dwi = tmp_path / "sub-01_dwi.nii.gz"
+
+    # A bare image, as written by DIPY: nothing to find, nothing required.
+    _write_nifti(dwi)
+    te, tr, info = read_te_tr(path=dwi)
+    assert (te, tr) == (None, None)
+    assert info == {
+        "te_source": None,
+        "tr_source": None,
+        "sidecar": None,
+        "field_strength": None,
+    }
+
+    # Header TR in milliseconds and in seconds describe the same acquisition.
+    _write_timed_nifti(dwi, tr=5520.0, time_unit="msec")
+    te, tr, info = read_te_tr(path=dwi)
+    assert te is None and info["te_source"] is None
+    npt.assert_allclose(tr, 5.52)
+    assert info["tr_source"] == "header"
+    _write_timed_nifti(dwi, tr=5.52, time_unit="sec")
+    npt.assert_allclose(read_te_tr(path=dwi)[1], 5.52)
+    assert read_te_tr(path=dwi, use_header=False)[1] is None
+
+    # Untrustworthy headers: 1 s placeholder, or no declared time unit.
+    _write_timed_nifti(dwi, tr=1.0, time_unit="sec")
+    assert read_te_tr(path=dwi)[1] is None
+    _write_timed_nifti(dwi, tr=5.52, time_unit="unknown")
+    assert read_te_tr(path=dwi)[1] is None
+
+    # The BIDS sidecar (seconds) wins over the header.
+    _write_timed_nifti(dwi, tr=7000.0, time_unit="msec")
+    sidecar = tmp_path / "sub-01_dwi.json"
+    sidecar.write_text(
+        json.dumps(
+            {"EchoTime": 0.0895, "RepetitionTime": 5.52, "MagneticFieldStrength": 3}
+        )
+    )
+    te, tr, info = read_te_tr(path=dwi)
+    assert (te, tr) == (0.0895, 5.52)
+    assert (info["te_source"], info["tr_source"]) == ("sidecar", "sidecar")
+    assert info["sidecar"] == str(sidecar)
+    assert info["field_strength"] == 3.0
+
+    # Explicit values win over everything.
+    te, tr, info = read_te_tr(path=dwi, te=0.1)
+    assert (te, tr) == (0.1, 5.52)
+    assert (info["te_source"], info["tr_source"]) == ("explicit", "sidecar")
+    assert read_te_tr(te=0.1, tr=4.0)[:2] == (0.1, 4.0)
+
+
+def test_read_te_tr_rejects_invalid_values(tmp_path):
+    """Bad file values are dropped, bad explicit values raise."""
+    dwi = tmp_path / "sub-01_dwi.nii.gz"
+    _write_nifti(dwi)
+    sidecar = tmp_path / "sub-01_dwi.json"
+
+    # Milliseconds in a sidecar violate BIDS: ignored, never rescaled.
+    sidecar.write_text(json.dumps({"EchoTime": 89.5, "RepetitionTime": 5520}))
+    assert read_te_tr(path=dwi)[:2] == (None, None)
+
+    # Only one usable key.
+    sidecar.write_text(json.dumps({"EchoTime": 0.0895, "RepetitionTime": "n/a"}))
+    te, tr, info = read_te_tr(path=dwi)
+    assert (te, tr) == (0.0895, None)
+    assert (info["te_source"], info["tr_source"]) == ("sidecar", None)
+
+    # Inconsistent file values are dropped, explicit ones are kept.
+    sidecar.write_text(json.dumps({"EchoTime": 0.09, "RepetitionTime": 0.05}))
+    assert read_te_tr(path=dwi)[:2] == (None, None)
+    assert read_te_tr(path=dwi, tr=4.0)[:2] == (0.09, 4.0)
+
+    with pytest.raises(ValueError, match="milliseconds"):
+        read_te_tr(path=dwi, te=89.5)
+    with pytest.raises(ValueError):
+        read_te_tr(te=0.2, tr=0.1)

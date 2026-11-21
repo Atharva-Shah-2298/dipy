@@ -145,6 +145,37 @@ cdef inline double sample_gm_d_iso() noexcept:
     return _sample_uniform_or_fixed(GM_D_MIN, GM_D_MAX)
 
 
+cdef inline object _mix_intra_extra(
+    double f_intra, object S_in, object S_ex, object relaxation_weights
+):
+    """
+    Combine the intra- and extra-axonal signals of one fiber population.
+
+    Parameters
+    ----------
+    f_intra : double
+        Intra-axonal volume fraction.
+    S_in : ndarray
+        Intra-axonal (stick) signal.
+    S_ex : ndarray
+        Extra-axonal (zeppelin) signal.
+    relaxation_weights : sequence of 4 floats or None
+        Relaxation weights ``(wm_intra, wm_extra, gm, csf)``. ``None`` gives
+        the original, relaxation-free FORCE mixture.
+
+    Returns
+    -------
+    S : ndarray
+        Mixed white matter signal of the fiber population.
+    """
+    if relaxation_weights is None:
+        return f_intra * S_in + (1.0 - f_intra) * S_ex
+    return (
+        f_intra * float(relaxation_weights[0]) * S_in
+        + (1.0 - f_intra) * float(relaxation_weights[1]) * S_ex
+    )
+
+
 cdef Py_ssize_t _closest_direction(
     cnp.ndarray[DTYPE_t, ndim=2] target_sphere,
     cnp.ndarray[DTYPE_t, ndim=1] vec
@@ -233,7 +264,8 @@ cpdef tuple generate_single_fiber(
     cnp.ndarray[DTYPE_t, ndim=1] bvals,
     cnp.ndarray[DTYPE_t, ndim=2] bvecs,
     object multi_tensor_func,
-    bint tortuosity
+    bint tortuosity,
+    object relaxation_weights=None
 ):
     """
     Generate diffusion signal for a single fiber population.
@@ -256,6 +288,9 @@ cpdef tuple generate_single_fiber(
         Function to compute multi-tensor signal.
     tortuosity : bool
         Whether to use tortuosity constraint.
+    relaxation_weights : sequence of 4 floats or None, optional
+        Relaxation weights ``(wm_intra, wm_extra, gm, csf)`` applied to the
+        compartment signals before mixing. ``None`` disables weighting.
 
     Returns
     -------
@@ -301,7 +336,7 @@ cpdef tuple generate_single_fiber(
     S_in = multi_tensor_func(mevals_in, evecs, fodf_gt * 100.0, bvals, bvecs)
     S_ex = multi_tensor_func(mevals_ex, evecs, fodf_gt * 100.0, bvals, bvecs)
 
-    S = f_intra * S_in + f_extra * S_ex
+    S = _mix_intra_extra(f_intra, S_in, S_ex, relaxation_weights)
 
     nearest = _closest_direction(target_sphere, true_stick)
     labels[nearest] = 1
@@ -330,7 +365,8 @@ cpdef tuple generate_two_fibers(
     cnp.ndarray[DTYPE_t, ndim=2] bvecs,
     object multi_tensor_func,
     bint tortuosity,
-    double min_crossing_angle=DEFAULT_TWO_FIBER_MIN_ANGLE
+    double min_crossing_angle=DEFAULT_TWO_FIBER_MIN_ANGLE,
+    object relaxation_weights=None
 ):
     """
     Generate diffusion signal for two crossing fiber populations.
@@ -355,6 +391,9 @@ cpdef tuple generate_two_fibers(
         Whether to use tortuosity constraint.
     min_crossing_angle : float, optional
         Minimum separation between the two fibers, in degrees.
+    relaxation_weights : sequence of 4 floats or None, optional
+        Relaxation weights ``(wm_intra, wm_extra, gm, csf)`` applied to the
+        compartment signals before mixing. ``None`` disables weighting.
 
     Returns
     -------
@@ -429,10 +468,9 @@ cpdef tuple generate_two_fibers(
         S_in = multi_tensor_func(mevals_in, evecs, fodf_gt * 100.0, bvals, bvecs)
         S_ex = multi_tensor_func(mevals_ex, evecs, fodf_gt * 100.0, bvals, bvecs)
 
-        f_intra = float(f_in[i])
-        f_extra = 1.0 - f_intra
-
-        S += fiber_fractions[i] * (f_intra * S_in + f_extra * S_ex)
+        S += fiber_fractions[i] * _mix_intra_extra(
+            float(f_in[i]), S_in, S_ex, relaxation_weights
+        )
 
     labels[_closest_direction(target_sphere, true_stick1)] = 1
     labels[_closest_direction(target_sphere, true_stick2)] = 1
@@ -467,7 +505,8 @@ cpdef tuple generate_three_fibers(
     cnp.ndarray[DTYPE_t, ndim=2] bvecs,
     object multi_tensor_func,
     bint tortuosity,
-    double min_crossing_angle=DEFAULT_THREE_FIBER_MIN_ANGLE
+    double min_crossing_angle=DEFAULT_THREE_FIBER_MIN_ANGLE,
+    object relaxation_weights=None
 ):
     """
     Generate diffusion signal for three crossing fiber populations.
@@ -492,6 +531,9 @@ cpdef tuple generate_three_fibers(
         Whether to use tortuosity constraint.
     min_crossing_angle : float, optional
         Minimum pairwise separation between the three fibers, in degrees.
+    relaxation_weights : sequence of 4 floats or None, optional
+        Relaxation weights ``(wm_intra, wm_extra, gm, csf)`` applied to the
+        compartment signals before mixing. ``None`` disables weighting.
 
     Returns
     -------
@@ -580,7 +622,9 @@ cpdef tuple generate_three_fibers(
         S_in = multi_tensor_func(mevals_in, evecs, fodf_gt * 100.0, bvals, bvecs)
         S_ex = multi_tensor_func(mevals_ex, evecs, fodf_gt * 100.0, bvals, bvecs)
 
-        S += fiber_fracs[k] * (float(f_in[k]) * S_in + (1.0 - float(f_in[k])) * S_ex)
+        S += fiber_fracs[k] * _mix_intra_extra(
+            float(f_in[k]), S_in, S_ex, relaxation_weights
+        )
 
     labels[_closest_direction(target_sphere, true_stick1)] = 1
     labels[_closest_direction(target_sphere, true_stick2)] = 1
@@ -616,7 +660,8 @@ cpdef tuple create_wm_signal(
     object multi_tensor_func,
     bint tortuosity,
     double two_fiber_min_angle=DEFAULT_TWO_FIBER_MIN_ANGLE,
-    double three_fiber_min_angle=DEFAULT_THREE_FIBER_MIN_ANGLE
+    double three_fiber_min_angle=DEFAULT_THREE_FIBER_MIN_ANGLE,
+    object relaxation_weights=None
 ):
     """
     Create white matter signal with specified number of fibers.
@@ -645,6 +690,9 @@ cpdef tuple create_wm_signal(
         Minimum separation for two-fiber configurations, in degrees.
     three_fiber_min_angle : float, optional
         Minimum pairwise separation for three-fiber configurations, in degrees.
+    relaxation_weights : sequence of 4 floats or None, optional
+        Relaxation weights ``(wm_intra, wm_extra, gm, csf)`` applied to the
+        compartment signals before mixing. ``None`` disables weighting.
 
     Returns
     -------
@@ -654,19 +702,20 @@ cpdef tuple create_wm_signal(
     if num_fib == 1:
         return generate_single_fiber(
             target_sphere, evecs, bingham_sf, odi_list,
-            bvals, bvecs, multi_tensor_func, tortuosity
+            bvals, bvecs, multi_tensor_func, tortuosity,
+            relaxation_weights
         )
     elif num_fib == 2:
         return generate_two_fibers(
             target_sphere, evecs, bingham_sf, odi_list,
             bvals, bvecs, multi_tensor_func, tortuosity,
-            two_fiber_min_angle
+            two_fiber_min_angle, relaxation_weights
         )
     elif num_fib == 3:
         return generate_three_fibers(
             target_sphere, evecs, bingham_sf, odi_list,
             bvals, bvecs, multi_tensor_func, tortuosity,
-            three_fiber_min_angle
+            three_fiber_min_angle, relaxation_weights
         )
     else:
         raise ValueError("num_fib must be 1, 2 or 3")
@@ -765,7 +814,8 @@ cpdef tuple create_mixed_signal(
     double wm_threshold,
     bint tortuosity,
     double two_fiber_min_angle=DEFAULT_TWO_FIBER_MIN_ANGLE,
-    double three_fiber_min_angle=DEFAULT_THREE_FIBER_MIN_ANGLE
+    double three_fiber_min_angle=DEFAULT_THREE_FIBER_MIN_ANGLE,
+    object relaxation_weights=None
 ):
     """
     Create mixed WM/GM/CSF tissue signal.
@@ -797,6 +847,13 @@ cpdef tuple create_mixed_signal(
         Minimum separation for two-fiber configurations, in degrees.
     three_fiber_min_angle : float, optional
         Minimum pairwise separation for three-fiber configurations, in degrees.
+    relaxation_weights : sequence of 4 floats or None, optional
+        Relaxation weights ``(wm_intra, wm_extra, gm, csf)``, e.g. from
+        :func:`dipy.sims.force.relaxation_weights`. Each compartment signal
+        is multiplied by its weight before the compartments are mixed, so
+        the reported fractions stay volume fractions while the signal
+        becomes acquisition (TE/TR) specific. ``None`` (default) gives the
+        original, relaxation-free FORCE signal.
 
     Returns
     -------
@@ -837,6 +894,7 @@ cpdef tuple create_mixed_signal(
         tortuosity,
         two_fiber_min_angle,
         three_fiber_min_angle,
+        relaxation_weights,
     )
     wm_signal = wm_result[0]
     wm_label = wm_result[1]
@@ -869,11 +927,19 @@ cpdef tuple create_mixed_signal(
     )
     nd = wm_fraction * float(wm_nd) + gm_fraction * float(gm_nd)
 
-    combined_signal = (
-        wm_fraction * wm_signal
-        + gm_fraction * gm_signal
-        + csf_fraction * csf_signal
-    )
+    if relaxation_weights is None:
+        combined_signal = (
+            wm_fraction * wm_signal
+            + gm_fraction * gm_signal
+            + csf_fraction * csf_signal
+        )
+    else:
+        # WM weights were applied per intra/extra-axonal compartment above.
+        combined_signal = (
+            wm_fraction * wm_signal
+            + gm_fraction * float(relaxation_weights[2]) * gm_signal
+            + csf_fraction * float(relaxation_weights[3]) * csf_signal
+        )
 
     if wm_fraction > wm_threshold:
         combined_odf = 50.0 * wm_fraction * wm_odf

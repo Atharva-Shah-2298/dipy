@@ -21,6 +21,7 @@ from dipy.reconst.force import (
     SignalIndex,
     _fwhm_kde_batch,
     _odi_grid_matches,
+    _relaxation_matches,
     _seed_matches,
     _weighted_percentile,
     compute_microstructure_uncertainty_ambiguity,
@@ -609,3 +610,157 @@ def test_cache_registry_separates_min_crossing_angles(tmp_path, monkeypatch):
     )
     assert len(list(cache_dir.glob("force_sim_*.npz"))) == 2
     npt.assert_array_equal(again.simulations["signals"], relaxed.simulations["signals"])
+
+
+def _fit_arrays(model, data):
+    """Fitted outputs of ``model`` for ``data`` as a dict of arrays."""
+    fit = model.fit(data)
+    names = [n for n, v in vars(FORCEFit).items() if isinstance(v, property)]
+    return {n: getattr(fit, n) for n in names if getattr(fit, n) is not None}
+
+
+def _noisy_test_signals(gtab, n=40):
+    from dipy.sims.force import generate_force_simulations
+
+    sims = generate_force_simulations(
+        gtab, num_simulations=n, seed=7, compute_dti=False, verbose=False
+    )
+    rng = np.random.default_rng(0)
+    return np.abs(sims["signals"] + rng.normal(0, 1.0, sims["signals"].shape))
+
+
+def test_force_model_without_relaxation_matches_original(tmp_path):
+    """No TE/TR, or relaxation disabled: library and fit are unchanged."""
+    gtab = _make_gtab([1000, 2000])
+    data = _noisy_test_signals(gtab)
+    path = str(tmp_path / "lib.npz")
+
+    def run(**model_kwargs):
+        model = FORCEModel(gtab, use_posterior=True, **model_kwargs)
+        model.generate(num_simulations=300, output_path=path)
+        return model, _fit_arrays(model, data)
+
+    original, original_fit = run()
+    assert original.relaxation is None
+    assert not original.relaxation_applied
+
+    variants = [
+        {"te": 0.1, "tr": 5.0},
+        {"te": 0.1, "tr": 5.0, "relaxation_model": None},
+        # Disabled means inert: even unusable timing is not inspected.
+        {"te": 100, "tr": 5000, "relaxation_model": None},
+    ]
+    models = [run(**kwargs) for kwargs in variants]
+    with pytest.warns(UserWarning, match="neither te nor tr"):
+        models.append(run(relaxation_model="tissue"))
+
+    for model, fit in models:
+        assert model.relaxation is None
+        assert not model.relaxation_applied
+        assert list(model.simulations) == list(original.simulations)
+        for key, value in original.simulations.items():
+            npt.assert_array_equal(model.simulations[key], value)
+        assert list(fit) == list(original_fit)
+        for key, value in original_fit.items():
+            npt.assert_array_equal(fit[key], value)
+
+
+def test_force_model_relaxation_keeps_outputs_and_microstructure():
+    """Relaxation-aware fits expose the same outputs; no parameter is added."""
+    gtab = _make_gtab([1000, 2000])
+    data = _noisy_test_signals(gtab)
+
+    original = FORCEModel(gtab).generate(num_simulations=300, use_cache=False)
+    aware = FORCEModel(gtab, te=0.12, tr=3.0, relaxation_model="tissue")
+    assert aware.relaxation["terms"] == ("t2", "t1")
+    assert not aware.relaxation_applied  # nothing generated yet
+    aware.generate(num_simulations=300, use_cache=False)
+    assert aware.relaxation_applied
+
+    # Same sampled microstructure behind both libraries.
+    for key in ("wm_fraction", "gm_fraction", "csf_fraction", "nd", "dispersion"):
+        npt.assert_array_equal(aware.simulations[key], original.simulations[key])
+    assert not np.array_equal(
+        aware.simulations["signals"], original.simulations["signals"]
+    )
+
+    fit_original = _fit_arrays(original, data)
+    fit_aware = _fit_arrays(aware, data)
+    assert list(fit_aware) == list(fit_original)
+    for key, value in fit_original.items():
+        assert np.shape(fit_aware[key]) == np.shape(value)
+
+    # TE alone applies the T2 factor; TR alone falls back to original FORCE.
+    with pytest.warns(UserWarning, match="only the T2"):
+        te_only = FORCEModel(gtab, te=0.12, relaxation_model="tissue")
+    assert te_only.relaxation["terms"] == ("t2",)
+    assert te_only.relaxation["tr"] is None
+    with pytest.warns(UserWarning, match="te is not available"):
+        tr_only = FORCEModel(gtab, tr=3.0, relaxation_model="tissue")
+    assert tr_only.relaxation is None
+
+    with pytest.raises(ValueError, match="milliseconds"):
+        FORCEModel(gtab, te=120, relaxation_model="tissue")
+
+
+def test_relaxation_matches_legacy_and_exact():
+    """Entries without weights are original libraries."""
+    weights = [0.26, 0.26, 0.29, 0.70]
+    assert _relaxation_matches({}, None)
+    assert not _relaxation_matches({}, weights)
+    assert not _relaxation_matches({"relaxation_weights": weights}, None)
+    assert _relaxation_matches({"relaxation_weights": weights}, np.array(weights))
+    assert not _relaxation_matches(
+        {"relaxation_weights": weights}, [0.26, 0.26, 0.29, 0.71]
+    )
+
+
+def test_force_cache_separates_relaxation_libraries(tmp_path, monkeypatch):
+    """Relaxation-aware and original libraries never share a cache entry."""
+    monkeypatch.setenv("DIPY_HOME", str(tmp_path))
+    gtab = _make_gtab([1000])
+
+    def gen(**model_kwargs):
+        model = FORCEModel(gtab, **model_kwargs)
+        model.generate(num_simulations=60, num_cpus=1, verbose=False)
+        return model
+
+    def weights():
+        return [e.get("relaxation_weights") for e in _registry(tmp_path)]
+
+    # 1. the original library registers exactly as before: no new key.
+    original = gen()
+    assert weights() == [None]
+    assert "relaxation_weights" not in _registry(tmp_path)[0]
+
+    # 2. a relaxation-aware request misses the original entry.
+    aware = gen(te=0.1, tr=5.0, relaxation_model="tissue")
+    assert len(weights()) == 2
+    npt.assert_allclose(weights()[1], aware.relaxation["weights"])
+    assert not np.array_equal(
+        aware.simulations["signals"], original.simulations["signals"]
+    )
+
+    # 3. both are served back from their own entry.
+    again = gen(te=0.1, tr=5.0, relaxation_model="tissue")
+    assert len(weights()) == 2
+    assert again.relaxation_applied
+    npt.assert_array_equal(again.simulations["signals"], aware.simulations["signals"])
+    original_again = gen(te=0.1, tr=5.0)  # relaxation disabled
+    assert len(weights()) == 2
+    assert not original_again.relaxation_applied
+    npt.assert_array_equal(
+        original_again.simulations["signals"], original.simulations["signals"]
+    )
+
+    # 4. another TE, a TE-only request and other relaxation times are distinct.
+    gen(te=0.14, tr=5.0, relaxation_model="tissue")
+    with pytest.warns(UserWarning, match="only the T2"):
+        gen(te=0.1, relaxation_model="tissue")
+    gen(
+        te=0.1,
+        tr=5.0,
+        relaxation_model="tissue",
+        relaxation_params={"csf": {"t2": 1.5}},
+    )
+    assert len(weights()) == 5

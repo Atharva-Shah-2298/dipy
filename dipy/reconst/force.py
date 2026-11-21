@@ -25,6 +25,7 @@ from dipy.sims.force import (
     get_default_diffusivity_config,
     load_force_simulations,
     resolve_num_odi_values,
+    resolve_relaxation,
     save_force_simulations,
 )
 from dipy.utils.logging import logger
@@ -230,6 +231,20 @@ def _seed_matches(entry, seed):
     return int(entry_seed) == int(seed)
 
 
+def _relaxation_matches(entry, relaxation_weights):
+    """Check whether a registry *entry*'s relaxation weighting matches.
+
+    Entries without ``relaxation_weights`` are original (relaxation-free)
+    FORCE libraries and only match requests without relaxation weighting.
+    """
+    entry_weights = entry.get("relaxation_weights")
+    if entry_weights is None or relaxation_weights is None:
+        return entry_weights is None and relaxation_weights is None
+    return len(entry_weights) == len(relaxation_weights) and np.allclose(
+        entry_weights, relaxation_weights, rtol=1e-9, atol=0.0
+    )
+
+
 def _find_cached_simulation(
     cache_dir,
     gtab,
@@ -239,6 +254,7 @@ def _find_cached_simulation(
     num_odi_values,
     min_crossing_angles,
     seed,
+    relaxation_weights=None,
 ):
     """Search the registry for a simulation matching the given parameters.
 
@@ -260,6 +276,9 @@ def _find_cached_simulation(
         ``(two_fiber_min_angle, three_fiber_min_angle)`` in degrees.
     seed : int or None
         Generation seed requested for the library.
+    relaxation_weights : sequence of float or None, optional
+        Compartment relaxation weights of the requested library, ``None``
+        for the original relaxation-free library.
 
     Returns
     -------
@@ -290,6 +309,8 @@ def _find_cached_simulation(
                 legacy_seed_cache_reported = True
         if not _seed_matches(entry, seed):
             continue
+        if not _relaxation_matches(entry, relaxation_weights):
+            continue
         candidate = cache_dir / entry["filename"]
         if candidate.exists():
             return str(candidate)
@@ -306,6 +327,7 @@ def _register_cached_simulation(
     num_odi_values,
     min_crossing_angles,
     seed,
+    relaxation_weights=None,
 ):
     """Add a new entry to the cache registry.
 
@@ -329,6 +351,9 @@ def _register_cached_simulation(
         ``(two_fiber_min_angle, three_fiber_min_angle)`` in degrees.
     seed : int or None
         Generation seed used for the library.
+    relaxation_weights : sequence of float or None, optional
+        Compartment relaxation weights used for the library. ``None``
+        (original FORCE) adds nothing to the registry entry.
     """
 
     # Convert numpy types to plain Python for JSON serialisation
@@ -357,6 +382,8 @@ def _register_cached_simulation(
         "seed": None if seed is None else int(seed),
         "filename": filename,
     }
+    if relaxation_weights is not None:
+        entry["relaxation_weights"] = [float(w) for w in relaxation_weights]
 
     def _append(registry):
         registry.append(entry)
@@ -758,6 +785,10 @@ class FORCEModel(ReconstModel):
         posterior_beta=2000.0,
         compute_odf=False,
         verbose=False,
+        te=None,
+        tr=None,
+        relaxation_model=None,
+        relaxation_params=None,
     ):
         r"""
         FORCE (FORward matching for Complex microstructure Estimation) model
@@ -788,6 +819,24 @@ class FORCEModel(ReconstModel):
             Compute posterior ODF maps.
         verbose : bool, optional
             Show progress bar and status messages.
+        te : float or None, optional
+            Echo time in seconds. Only used when ``relaxation_model`` is set.
+        tr : float or None, optional
+            Repetition time in seconds. Only used when ``relaxation_model``
+            is set.
+        relaxation_model : str or None, optional
+            ``None`` (default) is the original FORCE model: ``te`` and ``tr``
+            are ignored. ``"tissue"`` makes :meth:`generate` weight each
+            simulated compartment signal by its spin-echo relaxation factor
+            for this acquisition before the compartments are mixed. With
+            ``te`` but no ``tr`` only the $T_2$ factor is applied. Without
+            ``te`` the original FORCE library is generated, because a
+            $T_1$-only correction is not justified. Both cases issue a
+            warning. See ``relaxation`` and ``relaxation_applied``.
+        relaxation_params : dict or None, optional
+            Compartment relaxation times in seconds, see
+            :func:`dipy.sims.force.validate_relaxation_params`. Defaults to
+            :func:`dipy.sims.force.get_default_relaxation_params` (3 T).
 
         Notes
         -----
@@ -795,6 +844,13 @@ class FORCEModel(ReconstModel):
         parallel execution. Pass `engine` and `n_jobs` kwargs to the fit method:
 
         Available engines: "serial", "ray", "joblib", "dask".
+
+        Relaxation weighting changes the simulated signals only. Priors,
+        matching, normalization and outputs are those of the original
+        model, and no parameter is added to the fit. In a relaxation-aware
+        library the tissue fractions are volume fractions corrected for the
+        assumed compartment relaxation, whereas the original model reports
+        relaxation-weighted signal fractions of the acquisition.
 
         References
         ----------
@@ -808,6 +864,18 @@ class FORCEModel(ReconstModel):
         self.posterior_beta = posterior_beta
         self.compute_odf = compute_odf
         self.verbose = verbose
+        self.te = te
+        self.tr = tr
+        self.relaxation_model = relaxation_model
+        self.relaxation_params = relaxation_params
+        # None: original FORCE. Otherwise the resolved weighting, see
+        # dipy.sims.force.resolve_relaxation.
+        self.relaxation = resolve_relaxation(
+            te=te,
+            tr=tr,
+            relaxation_model=relaxation_model,
+            relaxation_params=relaxation_params,
+        )
 
         self._index = None
         self._penalty_array = None
@@ -848,6 +916,10 @@ class FORCEModel(ReconstModel):
 
         Set ``use_cache=False`` to force regeneration even when a matching
         cached simulation exists.
+
+        If the model was created with ``relaxation_model`` and ``te`` and/or
+        ``tr``, the library is relaxation weighted and cached separately
+        from original libraries, keyed on its compartment weights.
 
         Parameters
         ----------
@@ -934,6 +1006,16 @@ class FORCEModel(ReconstModel):
         )
         min_crossing_angles = (float(two_fiber_min_angle), float(three_fiber_min_angle))
         resolved_seed = None if seed is None else int(seed)
+        relaxation_w = None
+        relaxation_kwargs = {}
+        if self.relaxation is not None:
+            relaxation_w = self.relaxation["weights"]
+            relaxation_kwargs = {
+                "te": self.relaxation["te"],
+                "tr": self.relaxation["tr"],
+                "relaxation_model": self.relaxation["model"],
+                "relaxation_params": self.relaxation["params"],
+            }
 
         # --- Cache logic when no explicit output_path is given ----------
         if output_path is None and use_cache:
@@ -947,6 +1029,7 @@ class FORCEModel(ReconstModel):
                 resolved_num_odi,
                 min_crossing_angles,
                 resolved_seed,
+                relaxation_weights=relaxation_w,
             )
             if cached is not None:
                 if verbose:
@@ -971,6 +1054,7 @@ class FORCEModel(ReconstModel):
             compute_dti=compute_dti,
             compute_dki=compute_dki,
             verbose=verbose,
+            **relaxation_kwargs,
         )
 
         if output_path is not None:
@@ -1001,6 +1085,7 @@ class FORCEModel(ReconstModel):
                 resolved_num_odi,
                 min_crossing_angles,
                 resolved_seed,
+                relaxation_weights=relaxation_w,
             )
             if verbose:
                 print(f"[FORCE] Cached simulations to {cache_dir / filename}")
@@ -1025,6 +1110,17 @@ class FORCEModel(ReconstModel):
         self.simulations = load_force_simulations(input_path)
         self._prepare_library()
         return self
+
+    @property
+    def relaxation_applied(self):
+        """Whether the loaded library was simulated with relaxation weighting.
+
+        Returns
+        -------
+        applied : bool
+            True if the library in use carries ``relaxation_weights``.
+        """
+        return self.simulations is not None and "relaxation_weights" in self.simulations
 
     def _prepare_library(self):
         """Prepare library for matching."""

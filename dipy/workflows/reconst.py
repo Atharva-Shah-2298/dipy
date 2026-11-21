@@ -3499,6 +3499,9 @@ class ReconstForceFlow(Workflow):
         engine="serial",
         save_metrics=None,
         verbose=False,
+        relaxation_model=None,
+        te=None,
+        tr=None,
         out_dir="",
         out_fa="fa.nii.gz",
         out_md="md.nii.gz",
@@ -3608,6 +3611,22 @@ class ReconstForceFlow(Workflow):
             If not set, all available metrics are saved.
         verbose : bool, optional
             Whether to print verbose messages during processing.
+        relaxation_model : string, optional
+            Set to "tissue" to simulate TE/TR-aware signals: each tissue
+            compartment is weighted by its spin-echo relaxation factor
+            before mixing. If not set, the original FORCE model is used and
+            ``te``, ``tr`` and any metadata file are ignored.
+        te : float, optional
+            Echo time in seconds. Only used with ``relaxation_model``. If
+            not set, ``EchoTime`` of the JSON sidecar beside the input file
+            is used when present.
+        tr : float, optional
+            Repetition time in seconds. Only used with ``relaxation_model``.
+            If not set, ``RepetitionTime`` of the JSON sidecar beside the
+            input file, then the NIfTI header, is used when available.
+            A missing value is never assumed. Without ``tr`` only the T2
+            weighting is applied; without ``te`` the original FORCE model
+            is used.
         out_dir : string or Path, optional
             Output directory.
         out_fa : string, optional
@@ -3761,6 +3780,28 @@ class ReconstForceFlow(Workflow):
             if mask is not None:
                 mask = load_nifti_data(mask).astype(bool)
 
+            relaxation_kwargs = {}
+            if relaxation_model is not None:
+                from dipy.io.bids import read_te_tr
+
+                dwi_te, dwi_tr, timing = read_te_tr(path=dwi, te=te, tr=tr)
+                logger.info(
+                    f"FORCE relaxation timing: te={dwi_te} s "
+                    f"({timing['te_source']}), tr={dwi_tr} s "
+                    f"({timing['tr_source']})"
+                )
+                field = timing["field_strength"]
+                if field is not None and abs(field - 3.0) > 0.2:
+                    logger.warning(
+                        f"Sidecar reports a {field:g} T scanner but the "
+                        "default FORCE relaxation times are for 3 T."
+                    )
+                relaxation_kwargs = {
+                    "te": dwi_te,
+                    "tr": dwi_tr,
+                    "relaxation_model": relaxation_model,
+                }
+
             model = FORCEModel(
                 gtab,
                 penalty=penalty,
@@ -3769,6 +3810,7 @@ class ReconstForceFlow(Workflow):
                 posterior_beta=posterior_beta,
                 compute_odf=compute_odf,
                 verbose=verbose,
+                **relaxation_kwargs,
             )
 
             logger.info("Generating FORCE simulation library...")
@@ -3785,6 +3827,10 @@ class ReconstForceFlow(Workflow):
                 verbose=verbose,
                 **gen_range_kwargs,
             )
+            if relaxation_model is not None:
+                logger.info(
+                    f"FORCE relaxation weighting applied: {model.relaxation_applied}"
+                )
 
             logger.info("Fitting FORCE model...")
             force_fit = model.fit(

@@ -1,6 +1,7 @@
 """Tests for FORCE simulation module."""
 
 import numpy as np
+import numpy.testing as npt
 import pytest
 
 from dipy.sims.force import (
@@ -497,3 +498,329 @@ def test_generate_force_simulations_invalid_min_crossing_angle(kwargs):
         generate_force_simulations(
             gtab, num_simulations=10, batch_size=10, num_cpus=1, verbose=False, **kwargs
         )
+
+
+def _mixed_signal(seed, *, relaxation_weights=None, n=20):
+    """Draw ``n`` mixed voxels straight from the Cython simulator."""
+    from dipy.data import get_sphere
+    from dipy.sims._force_core import create_mixed_signal
+    from dipy.sims._multi_tensor_omp import multi_tensor
+    from dipy.sims.voxel import all_tensor_evecs
+
+    gtab = _make_gtab([1000, 3000])
+    sphere = np.ascontiguousarray(get_sphere(name="repulsion100").vertices)
+    evecs = np.array([all_tensor_evecs(tuple(v)) for v in sphere])
+    odi = np.array([0.05, 0.2])
+    lut = dispersion_lut(sphere, odi)
+    bvals = np.ascontiguousarray(gtab.bvals, dtype=np.float64)
+    bvecs = np.ascontiguousarray(gtab.bvecs, dtype=np.float64)
+
+    state = np.random.get_state()
+    np.random.seed(seed)
+    try:
+        return bvals, [
+            create_mixed_signal(
+                sphere,
+                evecs,
+                lut,
+                odi,
+                bvals,
+                bvecs,
+                multi_tensor,
+                0.5,
+                False,
+                30.0,
+                60.0,
+                relaxation_weights,
+            )
+            for _ in range(n)
+        ]
+    finally:
+        np.random.set_state(state)
+
+
+def test_relaxation_weights_follow_spin_echo_model():
+    """TE and TR weighting match the analytic spin-echo expression."""
+    from dipy.sims.force import (
+        RELAXATION_COMPARTMENTS,
+        get_default_relaxation_params,
+        relaxation_weights,
+    )
+
+    params = get_default_relaxation_params()
+    t1 = np.array(
+        [
+            params[c[:2] if c.startswith("wm") else c]["t1"]
+            for c in RELAXATION_COMPARTMENTS
+        ]
+    )
+    t2 = np.array(
+        [
+            params[c[:2] if c.startswith("wm") else c]["t2"]
+            for c in RELAXATION_COMPARTMENTS
+        ]
+    )
+
+    te, tr = 0.1, 3.0
+    npt.assert_allclose(relaxation_weights(te=te), np.exp(-te / t2))
+    npt.assert_allclose(relaxation_weights(tr=tr), 1 - np.exp(-tr / t1))
+    npt.assert_allclose(
+        relaxation_weights(te=te, tr=tr),
+        relaxation_weights(te=te) * relaxation_weights(tr=tr),
+    )
+    # No metadata, no weighting.
+    npt.assert_array_equal(relaxation_weights(), np.ones(4))
+
+    # Longer TE attenuates every compartment, short-T2 tissue the most, so
+    # the CSF signal share grows with TE.
+    w_te = np.array([relaxation_weights(te=t) for t in (0.06, 0.1, 0.14)])
+    assert np.all(np.diff(w_te, axis=0) < 0)
+    assert np.all(np.diff(w_te[:, 3] / w_te[:, 0]) > 0)
+
+    # Longer TR recovers every compartment towards 1, long-T1 CSF last.
+    w_tr = np.array([relaxation_weights(tr=t) for t in (2.0, 5.0, 8.0, 60.0)])
+    assert np.all(np.diff(w_tr, axis=0) > 0)
+    assert np.all(w_tr[:3, 3] < w_tr[:3, 0])
+    npt.assert_allclose(w_tr[-1], 1.0, atol=1e-6)
+
+
+def test_relaxation_times_are_seconds():
+    """Millisecond inputs are rejected instead of being silently rescaled."""
+    from dipy.sims.force import relaxation_weights, validate_te_tr
+
+    assert validate_te_tr(te=0.0895, tr=5.52) == (0.0895, 5.52)
+    assert validate_te_tr() == (None, None)
+    # The same acquisition expressed in ms and converted gives equal weights.
+    npt.assert_array_equal(
+        relaxation_weights(te=89.5 / 1000, tr=5520 / 1000),
+        relaxation_weights(te=0.0895, tr=5.52),
+    )
+    for kwargs in (
+        {"te": 89.5},
+        {"tr": 5520},
+        {"te": 0.0},
+        {"tr": -1.0},
+        {"te": np.nan},
+        {"te": "long"},
+        {"te": 0.5, "tr": 0.2},
+    ):
+        with pytest.raises(ValueError):
+            validate_te_tr(**kwargs)
+    with pytest.raises(ValueError, match="milliseconds"):
+        relaxation_weights(te=0.1, relaxation_params={"wm": {"t2": 75}})
+
+
+def test_validate_relaxation_params():
+    """Defaults fill the gaps; WM sub-compartments inherit from WM."""
+    from dipy.sims.force import (
+        DEFAULT_RELAXATION_PARAMS,
+        get_default_relaxation_params,
+        validate_relaxation_params,
+    )
+
+    defaults = get_default_relaxation_params()
+    resolved = validate_relaxation_params(None)
+    assert set(resolved) == {"wm_intra", "wm_extra", "gm", "csf"}
+    assert resolved["wm_intra"] == resolved["wm_extra"] == defaults["wm"]
+    assert resolved["gm"] == defaults["gm"]
+
+    # A returned copy can be edited without touching the module defaults.
+    defaults["wm"]["t2"] = 0.5
+    assert DEFAULT_RELAXATION_PARAMS["wm"]["t2"] != 0.5
+
+    custom = validate_relaxation_params(
+        {"wm": {"t2": 0.07}, "wm_intra": {"t2": 0.09}, "csf": {"t1": 4.0}}
+    )
+    assert custom["wm_intra"]["t2"] == 0.09
+    assert custom["wm_extra"]["t2"] == 0.07
+    assert custom["wm_extra"]["t1"] == DEFAULT_RELAXATION_PARAMS["wm"]["t1"]
+    assert custom["csf"] == {"t1": 4.0, "t2": DEFAULT_RELAXATION_PARAMS["csf"]["t2"]}
+
+    for bad in (
+        {"bone": {"t1": 1.0}},
+        {"wm": {"t3": 1.0}},
+        {"gm": {"t1": 0.05, "t2": 0.08}},
+        {"gm": {"t2": 0.0}},
+    ):
+        with pytest.raises(ValueError):
+            validate_relaxation_params(bad)
+
+
+def test_resolve_relaxation_disabled_or_without_metadata():
+    """Relaxation is opt-in and never invents a TE or TR."""
+    from dipy.sims.force import resolve_relaxation
+
+    assert resolve_relaxation() is None
+    # Disabled: timing is ignored entirely, even if implausible.
+    assert resolve_relaxation(te=0.1, tr=5.0) is None
+    assert resolve_relaxation(te=100, tr=5000, relaxation_model=None) is None
+
+    with pytest.warns(UserWarning, match="neither te nor tr"):
+        assert resolve_relaxation(relaxation_model="tissue") is None
+
+    both = resolve_relaxation(te=0.1, tr=3.0, relaxation_model="tissue")
+    assert both["terms"] == ("t2", "t1")
+
+    # TE alone: T2 weighting only, flagged as partial.
+    with pytest.warns(UserWarning, match="only the T2"):
+        te_only = resolve_relaxation(te=0.1, relaxation_model="tissue")
+    assert te_only["terms"] == ("t2",) and te_only["tr"] is None
+    assert np.all(te_only["weights"] > both["weights"])
+
+    # TR alone: a T1-only correction is not justified, original FORCE is used.
+    with pytest.warns(UserWarning, match="te is not available"):
+        assert resolve_relaxation(tr=3.0, relaxation_model="tissue") is None
+
+    with pytest.raises(ValueError, match="relaxation_model"):
+        resolve_relaxation(te=0.1, relaxation_model="voxel")
+
+
+def test_generate_force_simulations_unchanged_without_relaxation():
+    """Disabled or metadata-free calls reproduce the original library."""
+    from dipy.sims.force import generate_force_simulations
+
+    gtab = _make_gtab([1000, 2000])
+    kwargs = {"num_simulations": 60, "batch_size": 20, "verbose": False}
+
+    original = generate_force_simulations(gtab, **kwargs)
+    disabled = generate_force_simulations(
+        gtab, te=0.1, tr=5.0, relaxation_model=None, **kwargs
+    )
+    ignored = generate_force_simulations(gtab, te=0.1, tr=5.0, **kwargs)
+    with pytest.warns(UserWarning, match="neither te nor tr"):
+        no_metadata = generate_force_simulations(
+            gtab, relaxation_model="tissue", **kwargs
+        )
+
+    for sims in (disabled, ignored, no_metadata):
+        assert list(sims) == list(original)
+        for key in original:
+            npt.assert_array_equal(sims[key], original[key])
+
+
+def test_relaxation_branch_matches_original_mixture():
+    """Unit weights reproduce the original signal bit for bit."""
+    _, original = _mixed_signal(11)
+    _, unit = _mixed_signal(11, relaxation_weights=np.ones(4))
+    for res_o, res_u in zip(original, unit, strict=True):
+        for out_o, out_u in zip(res_o, res_u, strict=True):
+            npt.assert_array_equal(out_u, out_o)
+
+
+def test_relaxation_weights_compartments_before_mixing():
+    """Each compartment is scaled by its own weight, then mixed."""
+    bvals, original = _mixed_signal(3)
+
+    # Nulling CSF removes exactly csf_fraction * S_csf(b).
+    _, no_csf = _mixed_signal(3, relaxation_weights=[1.0, 1.0, 1.0, 0.0])
+    # Halving only the CSF weight removes half of it.
+    _, half_csf = _mixed_signal(3, relaxation_weights=[1.0, 1.0, 1.0, 0.5])
+    # Keeping only WM, with unequal intra/extra weights.
+    _, wm_only = _mixed_signal(3, relaxation_weights=[1.0, 1.0, 0.0, 0.0])
+    _, intra_only = _mixed_signal(3, relaxation_weights=[1.0, 0.0, 0.0, 0.0])
+    _, extra_only = _mixed_signal(3, relaxation_weights=[0.0, 1.0, 0.0, 0.0])
+
+    csf = 100.0 * np.exp(-bvals * 3.0e-3)
+    for i, res in enumerate(original):
+        csf_fraction = res[6]
+        npt.assert_allclose(res[0] - no_csf[i][0], csf_fraction * csf, atol=1e-9)
+        npt.assert_allclose(
+            res[0] - half_csf[i][0], 0.5 * csf_fraction * csf, atol=1e-9
+        )
+        npt.assert_allclose(
+            intra_only[i][0] + extra_only[i][0], wm_only[i][0], atol=1e-9
+        )
+        assert intra_only[i][0].max() > 0 and extra_only[i][0].max() > 0
+        # Sampled microstructure is untouched by the weights.
+        for j in range(1, len(res)):
+            npt.assert_array_equal(no_csf[i][j], res[j])
+
+
+def test_relaxation_preserves_sampled_microstructure_and_priors():
+    """Same seed: same configurations, different signals, no new parameter."""
+    from dipy.sims.force import generate_force_simulations
+
+    gtab = _make_gtab([1000, 2000])
+    kwargs = {"num_simulations": 2000, "batch_size": 500, "verbose": False}
+    original = generate_force_simulations(gtab, **kwargs)
+    aware = generate_force_simulations(
+        gtab, te=0.12, tr=3.0, relaxation_model="tissue", **kwargs
+    )
+
+    signal_derived = {"signals", "fa", "md", "rd"}
+    assert set(aware) - set(original) == {"relaxation_weights"}
+    assert set(original) - set(aware) == set()
+    assert aware["relaxation_weights"].shape == (4,)
+    for key in set(original) - signal_derived:
+        npt.assert_array_equal(aware[key], original[key])
+    assert not np.array_equal(aware["signals"], original["signals"])
+
+    # The priors themselves: Dirichlet(2, 1, 1) tissue fractions and
+    # 10/20/70 % one/two/three-fiber voxels.
+    fractions = np.stack(
+        [aware["wm_fraction"], aware["gm_fraction"], aware["csf_fraction"]], axis=1
+    )
+    npt.assert_allclose(fractions.sum(axis=1), 1.0, atol=1e-5)
+    npt.assert_allclose(fractions.mean(axis=0), [0.5, 0.25, 0.25], atol=0.03)
+    counts = np.bincount(aware["num_fibers"].astype(int), minlength=4)[1:]
+    npt.assert_allclose(counts / counts.sum(), [0.1, 0.2, 0.7], atol=0.04)
+
+
+def _unit_rows(signals):
+    signals = np.asarray(signals, dtype=np.float64)
+    return signals / np.linalg.norm(signals, axis=1, keepdims=True)
+
+
+def test_relaxation_changes_normalized_signal_only_if_compartments_differ():
+    """Distinct relaxation times reshape the signal; equal ones only scale."""
+    from dipy.sims.force import generate_force_simulations, relaxation_weights
+
+    gtab = _make_gtab([1000, 2000])
+    kwargs = {
+        "num_simulations": 60,
+        "batch_size": 20,
+        "compute_dti": False,
+        "verbose": False,
+        "dtype": np.float64,
+    }
+    original = generate_force_simulations(gtab, **kwargs)
+
+    same = {c: {"t1": 1.0, "t2": 0.08} for c in ("wm", "gm", "csf")}
+    common = generate_force_simulations(
+        gtab,
+        te=0.1,
+        tr=3.0,
+        relaxation_model="tissue",
+        relaxation_params=same,
+        **kwargs,
+    )
+    weights = relaxation_weights(te=0.1, tr=3.0, relaxation_params=same)
+    assert np.ptp(weights) == 0
+    npt.assert_allclose(common["signals"], weights[0] * original["signals"])
+    npt.assert_allclose(
+        _unit_rows(common["signals"]), _unit_rows(original["signals"]), atol=1e-12
+    )
+
+    aware = generate_force_simulations(
+        gtab, te=0.1, tr=3.0, relaxation_model="tissue", **kwargs
+    )
+    shape_change = np.abs(
+        _unit_rows(aware["signals"]) - _unit_rows(original["signals"])
+    ).max(axis=1)
+    assert np.median(shape_change) > 1e-3
+
+    # Longer TE moves the normalized signal further from the original, and a
+    # different TR gives yet another library.
+    longer = generate_force_simulations(
+        gtab, te=0.14, tr=3.0, relaxation_model="tissue", **kwargs
+    )
+    longer_change = np.abs(
+        _unit_rows(longer["signals"]) - _unit_rows(original["signals"])
+    ).max(axis=1)
+    assert np.median(longer_change) > np.median(shape_change)
+    other_tr = generate_force_simulations(
+        gtab, te=0.1, tr=8.0, relaxation_model="tissue", **kwargs
+    )
+    assert not np.allclose(
+        _unit_rows(other_tr["signals"]), _unit_rows(aware["signals"]), atol=1e-6
+    )

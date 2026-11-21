@@ -541,6 +541,140 @@ def read_sidecar(*, root, path):
     return (chain[0] if chain else None), metadata
 
 
+def _header_tr(*, path):
+    """Read the repetition time of a 4D NIfTI image from its header.
+
+    Parameters
+    ----------
+    path : str or Path
+        NIfTI file.
+
+    Returns
+    -------
+    tr : float or None
+        Repetition time in seconds, or None when the header does not hold a
+        trustworthy value: the image is not 4D, the time unit is not
+        declared, or the spacing is the 1 s placeholder many tools write.
+    """
+    import nibabel as nib
+
+    from dipy.sims.force import validate_te_tr
+
+    header = nib.load(path).header
+    if len(header.get_data_shape()) < 4:
+        return None
+    scale = {"sec": 1.0, "msec": 1e-3, "usec": 1e-6}.get(header.get_xyzt_units()[1])
+    if scale is None:
+        return None
+    tr = float(header.get_zooms()[3]) * scale
+    if tr == 1.0:
+        return None
+    try:
+        return validate_te_tr(tr=tr)[1]
+    except ValueError:
+        return None
+
+
+def read_te_tr(*, path=None, sidecar=None, te=None, tr=None, use_header=True):
+    """Find the echo and repetition times of an acquisition, in seconds.
+
+    Each value is taken from the first source that provides a valid one:
+
+    1. the explicit ``te`` / ``tr`` arguments,
+    2. ``EchoTime`` / ``RepetitionTime`` of a BIDS JSON sidecar (seconds),
+    3. for the repetition time only, the temporal spacing of the NIfTI
+       header. NIfTI has no echo time field.
+
+    A value that no source provides stays ``None``: nothing is guessed, and
+    no file other than ``path`` is required to exist.
+
+    Parameters
+    ----------
+    path : str or Path, optional
+        NIfTI image. Needed for the sibling sidecar and the header lookup.
+    sidecar : str or Path, optional
+        JSON sidecar. When None, ``<image stem>.json`` beside ``path`` is
+        used if it exists.
+    te : float, optional
+        Explicit echo time in seconds.
+    tr : float, optional
+        Explicit repetition time in seconds.
+    use_header : bool, optional
+        Whether the NIfTI header may supply the repetition time.
+
+    Returns
+    -------
+    te : float or None
+        Echo time in seconds.
+    tr : float or None
+        Repetition time in seconds.
+    info : dict
+        ``"te_source"`` and ``"tr_source"`` (``"explicit"``, ``"sidecar"``,
+        ``"header"`` or None), ``"sidecar"`` (path of the JSON file read, or
+        None) and ``"field_strength"`` (``MagneticFieldStrength`` in tesla
+        from the sidecar, or None).
+
+    Raises
+    ------
+    ValueError
+        If an explicit ``te`` or ``tr`` is invalid, e.g. in milliseconds.
+        Invalid values found in files are ignored with a warning instead.
+    """
+    from dipy.sims.force import validate_te_tr
+
+    te, tr = validate_te_tr(te=te, tr=tr)
+    info = {
+        "te_source": None if te is None else "explicit",
+        "tr_source": None if tr is None else "explicit",
+        "sidecar": None,
+        "field_strength": None,
+    }
+
+    if sidecar is None and path is not None:
+        stem, _ = split_extension(filename=path)
+        candidate = Path(path).parent / f"{stem}.json"
+        sidecar = candidate if candidate.is_file() else None
+
+    if sidecar is not None:
+        metadata = _read_json(path=sidecar)
+        info["sidecar"] = str(sidecar)
+        strength = metadata.get("MagneticFieldStrength")
+        if isinstance(strength, (int, float)) and not isinstance(strength, bool):
+            info["field_strength"] = float(strength)
+        for name, key in (("te", "EchoTime"), ("tr", "RepetitionTime")):
+            if info[f"{name}_source"] is not None or key not in metadata:
+                continue
+            try:
+                value = validate_te_tr(**{name: metadata[key]})[name == "tr"]
+            except ValueError as e:
+                logger.warning(f"Ignoring {key} of {sidecar}: {e}")
+                continue
+            if name == "te":
+                te = value
+            else:
+                tr = value
+            info[f"{name}_source"] = "sidecar"
+
+    if tr is None and use_header and path is not None:
+        tr = _header_tr(path=path)
+        if tr is not None:
+            info["tr_source"] = "header"
+
+    if te is not None and tr is not None and te >= tr:
+        if info["te_source"] == "explicit" and info["tr_source"] == "explicit":
+            raise ValueError(f"te ({te:g} s) must be shorter than tr ({tr:g} s)")
+        logger.warning(
+            f"Inconsistent timing (te={te:g} s >= tr={tr:g} s); ignoring the "
+            "values that were not given explicitly."
+        )
+        if info["te_source"] != "explicit":
+            te, info["te_source"] = None, None
+        if info["tr_source"] != "explicit":
+            tr, info["tr_source"] = None, None
+
+    return te, tr, info
+
+
 def _nearest_inherited(*, root, path, suffix, extensions):
     """Return the nearest applicable file among several extensions.
 
