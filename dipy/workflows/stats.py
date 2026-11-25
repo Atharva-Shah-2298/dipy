@@ -10,7 +10,7 @@ from scipy.ndimage import binary_dilation
 
 from dipy.core.gradients import gradient_table
 from dipy.io import read_bvals_bvecs
-from dipy.io.image import load_nifti, save_nifti
+from dipy.io.image import load_nifti, load_nifti_data, save_nifti
 from dipy.io.peaks import load_pam
 from dipy.io.streamline import load_tractogram
 from dipy.reconst.dti import TensorModel
@@ -182,6 +182,77 @@ class SNRinCCFlow(Workflow):
                 json.dump(data, myfile)
 
 
+_NIFTI_EXT = ".nii.gz"
+_DIRS_SUFFIX = "_dirs" + _NIFTI_EXT
+
+
+def _split_metric_files(nifti_files):
+    """Separate metric maps from peak direction files.
+
+    Parameters
+    ----------
+    nifti_files : iterable of Path
+        ``*.nii.gz`` files of a metric folder.
+
+    Returns
+    -------
+    metric_files : list of Path
+        Sorted metric files, excluding ``*_dirs.nii.gz``.
+    dirs_files : dict
+        Maps each direction-file prefix (file name without
+        ``_dirs.nii.gz``) to its path.
+
+    """
+    metric_files, dirs_files = [], {}
+    for path in sorted(Path(p) for p in nifti_files):
+        if path.name.endswith(_DIRS_SUFFIX):
+            dirs_files[path.name[: -len(_DIRS_SUFFIX)]] = path
+        else:
+            metric_files.append(path)
+    return metric_files, dirs_files
+
+
+def _match_peak_dirs_prefix(metric_name, dirs_prefixes):
+    """Return the direction-file prefix of a per-peak metric.
+
+    Parameters
+    ----------
+    metric_name : str
+        Metric file name without ``.nii.gz`` (e.g. ``force_peak_odi``).
+    dirs_prefixes : iterable of str
+        Prefixes of the available ``PREFIX_dirs.nii.gz`` files.
+
+    Returns
+    -------
+    prefix : str or None
+        Longest prefix such that ``metric_name == prefix`` or
+        ``metric_name`` starts with ``prefix + "_"``; None if none matches.
+
+    """
+    matches = [
+        p for p in dirs_prefixes if metric_name == p or metric_name.startswith(p + "_")
+    ]
+    return max(matches, key=len) if matches else None
+
+
+def _load_peak_dirs(metric_file, metric, dirs_files, cache):
+    """Return the peak directions of a 4D metric, or None if unavailable.
+
+    Direction volumes are loaded once and kept in ``cache`` (keyed by prefix).
+    """
+    name = Path(metric_file).name[: -len(_NIFTI_EXT)]
+    prefix = _match_peak_dirs_prefix(name, dirs_files)
+    if prefix is None:
+        logger.info(
+            f"Skipping metric {metric_file} with 4D shape {metric.shape}: "
+            f"no matching *{_DIRS_SUFFIX} file"
+        )
+        return None
+    if prefix not in cache:
+        cache[prefix] = load_nifti_data(dirs_files[prefix])
+    return cache[prefix]
+
+
 @warning_for_keywords()
 def buan_bundle_profiles(
     model_bundle_folder,
@@ -233,6 +304,14 @@ def buan_bundle_profiles(
     subject and returns a ``numpy`` array. Use ``buan_bundle_profiles`` for
     group studies and ``buan_profile`` for single-subject analysis.
 
+    3D metrics are interpolated along the streamlines. A 4D metric
+    ``NAME.nii.gz`` of shape (X, Y, Z, K) is a per-peak map whose directions
+    are read from ``PREFIX_dirs.nii.gz`` (X, Y, Z, K, 3), ``PREFIX`` being the
+    longest prefix such that ``NAME == PREFIX`` or ``NAME`` starts with
+    ``PREFIX + "_"``; each point takes the value of the peak most parallel to
+    the streamline. 4D metrics without a matching directions file are skipped
+    and ``*_dirs.nii.gz`` files are never treated as metrics.
+
     References
     ----------
     .. footbibliography::
@@ -253,6 +332,11 @@ def buan_bundle_profiles(
     logger.info(org_bd)
     n = len(mb)
 
+    metric_files_names_dti, dirs_files = _split_metric_files(
+        Path(metric_folder).glob("*.nii.gz")
+    )
+    peak_dirs_cache = {}
+
     for io in range(n):
         mbundles = load_tractogram(
             mb[io], reference="same", bbox_valid_check=False
@@ -267,8 +351,6 @@ def buan_bundle_profiles(
         if len(orig_bundles) > 5:
             _, indx = assignment_map(bundles, mbundles, no_disks)
             ind = np.array(indx)
-
-            metric_files_names_dti = list(Path(metric_folder).glob("*.nii.gz"))
 
             metric_files_names_csa = list(Path(metric_folder).glob("*.pam5"))
 
@@ -290,6 +372,13 @@ def buan_bundle_profiles(
                 logger.info(f"metric = {metric_files_names_dti[mn]}")
 
                 metric, _ = load_nifti(metric_files_names_dti[mn])
+                peak_dirs = None
+                if metric.ndim > 3:
+                    peak_dirs = _load_peak_dirs(
+                        metric_files_names_dti[mn], metric, dirs_files, peak_dirs_cache
+                    )
+                    if peak_dirs is None:
+                        continue
 
                 anatomical_measures(
                     transformed_orig_bundles,
@@ -301,6 +390,7 @@ def buan_bundle_profiles(
                     group_id,
                     ind,
                     out_dir,
+                    peak_dirs=peak_dirs,
                 )
 
             for mn in range(len(metric_files_names_csa)):
@@ -363,6 +453,16 @@ class BundleAnalysisTractometryFlow(Workflow):
           (or the paths are overridden via ``bundle_folder``,
           ``orig_bundle_folder``, and ``metric_folder``). Outputs ``.npy``
           profile arrays (one per bundle/metric pair).
+
+        The metric folder holds 3D scalar maps (``NAME.nii.gz``) and/or 4D
+        per-peak maps of shape (X, Y, Z, K). A per-peak map ``NAME.nii.gz``
+        takes its directions from ``PREFIX_dirs.nii.gz`` (X, Y, Z, K, 3),
+        where ``PREFIX`` is the longest prefix such that ``NAME == PREFIX`` or
+        ``NAME`` starts with ``PREFIX + "_"`` (e.g. ``peak_odi`` uses
+        ``peak_dirs``, ``afd`` uses ``afd_dirs``), and each streamline point
+        takes the value of the peak most parallel to the streamline. 4D maps
+        without a matching directions file are skipped, and
+        ``*_dirs.nii.gz`` files are not metrics.
 
         See :footcite:p:`Chandio2020a` for further details about the method.
 
@@ -539,7 +639,8 @@ class BundleAnalysisTractometryFlow(Workflow):
         if not org_list:
             logger.info("No original bundle files found in the specified folder")
             sys.exit(1)
-        metric_files = sorted(metric_folder.glob("*.nii.gz"))
+        metric_files, dirs_files = _split_metric_files(metric_folder.glob("*.nii.gz"))
+        peak_dirs_cache = {}
 
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -562,11 +663,13 @@ class BundleAnalysisTractometryFlow(Workflow):
                 metric, affine = load_nifti(metric_file)
                 fname = Path(metric_file).stem.replace(".nii", "")
                 logger.info(f"Applying metric {metric_file} on bundle {bname}")
+                peak_dirs = None
                 if metric.ndim > 3:
-                    logger.info(
-                        f"Skipping metric {metric_file} with 4D shape {metric.shape}"
+                    peak_dirs = _load_peak_dirs(
+                        metric_file, metric, dirs_files, peak_dirs_cache
                     )
-                    continue
+                    if peak_dirs is None:
+                        continue
                 profile = buan_profile(
                     mbundles,
                     bundles,
@@ -574,6 +677,7 @@ class BundleAnalysisTractometryFlow(Workflow):
                     metric,
                     affine,
                     no_disks=no_disks,
+                    peak_dirs=peak_dirs,
                 )
                 np.save(Path(out_dir) / f"{bname}_{fname}_profile.npy", profile)
 

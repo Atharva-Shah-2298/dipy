@@ -795,6 +795,110 @@ def values_from_volume(data, streamlines, affine):
         raise ValueError("Data needs to have 3 or 4 dimensions")
 
 
+def fixel_values_from_volume(data, peak_dirs, streamlines, affine, *, max_angle=45.0):
+    """Extract per-peak (fixel) values along streamlines by closest-fixel matching.
+
+    Parameters
+    ----------
+    data : ndarray, shape (X, Y, Z, K) or (X, Y, Z, K, ...)
+        Per-peak values. Slot ``k`` is aligned with ``peak_dirs[..., k, :]``.
+        Extra trailing dimensions (e.g. several stacked metrics) are carried
+        through to the output.
+    peak_dirs : ndarray, shape (X, Y, Z, K, 3)
+        Peak directions in voxel-coordinate axes (the frame used by DIPY peaks
+        for tracking). Directions are axial (sign-agnostic). A slot with zero
+        or non-finite direction is considered absent.
+    streamlines : Streamlines, list of ndarray (N_i, 3) or generator
+        Streamlines in world coordinates.
+    affine : ndarray, shape (4, 4)
+        Voxel-to-world affine of ``data`` (same convention as
+        :func:`values_from_volume`).
+    max_angle : float, optional
+        Maximum angle in degrees, in [0, 90], between the streamline tangent and
+        the matched peak direction.
+
+    Returns
+    -------
+    values : list of ndarray
+        One float array per streamline with shape ``(N_i,) + data.shape[4:]``.
+
+    Notes
+    -----
+    Each streamline point is mapped to its nearest voxel (voxel centers lie at
+    integer voxel coordinates). The local tangent is the central difference of
+    neighbouring points in voxel coordinates (forward/backward difference at the
+    endpoints). Among the present peaks of that voxel, the one with the largest
+    absolute cosine with the tangent is selected (closest-fixel strategy, as in
+    connectivity-based fixel enhancement by Raffelt et al., NeuroImage 117,
+    2015, and MRtrix3 ``tck2fixel`` :footcite:p:`Tournier2019`).
+
+    NaN marks points without a matching fixel: the voxel is outside the volume,
+    the voxel has no present peak, the best angle exceeds ``max_angle``, or the
+    streamline has a single point (no tangent).
+
+    References
+    ----------
+    .. footbibliography::
+    """
+    data = np.asarray(data)
+    peak_dirs = np.asarray(peak_dirs, dtype=float)
+    if (
+        data.ndim < 4
+        or peak_dirs.ndim != 5
+        or peak_dirs.shape[-1] != 3
+        or data.shape[:4] != peak_dirs.shape[:4]
+    ):
+        raise ValueError(
+            "data must have shape (X, Y, Z, K, ...) and peak_dirs shape "
+            f"(X, Y, Z, K, 3) with matching leading dims; got {data.shape} and "
+            f"{peak_dirs.shape}."
+        )
+    if not 0 <= max_angle <= 90:
+        raise ValueError("max_angle must be in [0, 90] degrees.")
+
+    if not isinstance(streamlines, Streamlines):
+        streamlines = Streamlines(list(streamlines))
+    lengths = np.asarray(streamlines._lengths, dtype=np.intp)
+    offsets = np.asarray(streamlines._offsets, dtype=np.intp)
+    trailing = data.shape[4:]
+    n_total = int(lengths.sum())
+    out = np.full((n_total,) + trailing, np.nan)
+
+    if n_total > 0:
+        # Gather points contiguously (streamline order), fully vectorized.
+        starts = np.repeat(np.cumsum(lengths) - lengths, lengths)
+        ends = starts + np.repeat(lengths, lengths) - 1
+        pos = np.arange(n_total)
+        idx = np.repeat(offsets, lengths) + (pos - starts)
+        pts = apply_affine(np.linalg.inv(affine), streamlines._data[idx])
+        tangent = pts[np.minimum(pos + 1, ends)] - pts[np.maximum(pos - 1, starts)]
+        tnorm = np.linalg.norm(tangent, axis=1)
+
+        vox = np.round(pts).astype(np.intp)
+        inside = np.all((vox >= 0) & (vox < np.array(data.shape[:3])), axis=1)
+        valid = inside & (tnorm > 0) & np.isfinite(tnorm)
+        sel = np.nonzero(valid)[0]
+        if sel.size:
+            v = vox[sel]
+            dirs = peak_dirs[v[:, 0], v[:, 1], v[:, 2]]  # (M, K, 3)
+            dnorm = np.linalg.norm(dirs, axis=-1)
+            present = np.isfinite(dnorm) & (dnorm > 0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                cos = np.abs(np.einsum("mkc,mc->mk", dirs, tangent[sel]))
+                cos = cos / (dnorm * tnorm[sel, None])
+            cos = np.where(present, cos, -1.0)
+            best = np.argmax(cos, axis=1)
+            best_cos = cos[np.arange(sel.size), best]
+            thr = np.cos(np.deg2rad(max_angle))
+            ok = best_cos >= thr - 1e-12
+            s = sel[ok]
+            vv = v[ok]
+            out[s] = data[vv[:, 0], vv[:, 1], vv[:, 2], best[ok]]
+
+    bounds = np.cumsum(lengths)[:-1]
+    return list(np.split(out, bounds)) if len(lengths) else []
+
+
 def nbytes(streamlines):
     """Calculate the memory footprint of a streamlines object.
 

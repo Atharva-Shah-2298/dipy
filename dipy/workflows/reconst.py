@@ -65,6 +65,7 @@ from dipy.reconst.shm import (
     CsaOdfModel,
     OpdtModel,
     QballModel,
+    SphHarmFit,
     anisotropic_power,
     normalize_data,
     order_from_ncoef,
@@ -1043,6 +1044,7 @@ class ReconstCSDFlow(Workflow):
         sh_order_max=8,
         parallel=False,
         extract_pam_values=False,
+        extract_afd=False,
         num_processes=None,
         out_dir="",
         out_pam="peaks.pam5",
@@ -1054,6 +1056,8 @@ class ReconstCSDFlow(Workflow):
         out_sphere="sphere.txt",
         out_b="B.nii.gz",
         out_qa="qa.nii.gz",
+        out_afd="afd.nii.gz",
+        out_afd_dirs="afd_dirs.nii.gz",
     ):
         """Constrained spherical deconvolution.
 
@@ -1131,6 +1135,11 @@ class ReconstCSDFlow(Workflow):
             calibration procedure.
         extract_pam_values : bool, optional
             Save or not to save pam volumes as single nifti files.
+        extract_afd : bool, optional
+            Save the apparent fiber density (AFD) of each fODF lobe and the
+            direction of each lobe's peak, see
+            :meth:`dipy.reconst.shm.SphHarmFit.afd`. As many lobes as pam peaks
+            are kept, sorted by decreasing peak amplitude.
         num_processes : int, optional
             If `parallel` is True, the number of subprocesses to use
             (default multiprocessing.cpu_count()). If < 0 the maximal number
@@ -1156,6 +1165,13 @@ class ReconstCSDFlow(Workflow):
             Name of the B Matrix to be saved.
         out_qa : string, optional
             Name of the Quantitative Anisotropy to be saved.
+        out_afd : string, optional
+            Name of the AFD volume to be saved, shape (X, Y, Z, npeaks).
+        out_afd_dirs : string, optional
+            Name of the AFD lobe directions volume to be saved, shape
+            (X, Y, Z, npeaks, 3), in the voxel frame of the pam peak
+            directions and in the slot order of ``out_afd``. Missing lobes
+            are zero.
 
 
         References
@@ -1189,6 +1205,8 @@ class ReconstCSDFlow(Workflow):
             osphere,
             ob,
             oqa,
+            oafd,
+            oafd_dirs,
         ) in io_it:
             logger.info(f"Loading {dwi}")
             data, affine = load_nifti(dwi)
@@ -1399,6 +1417,16 @@ class ReconstCSDFlow(Workflow):
                     fname_qa=oqa,
                     reshape_dirs=True,
                 )
+
+            if extract_afd:
+                # The pam SH coefficients use the basis of the model, so they
+                # describe the fitted fODFs and share the frame of the peaks.
+                csd_fit = SphHarmFit(csd_model, peaks_csd.shm_coeff, mask_vol)
+                afd, afd_dirs = csd_fit.afd(
+                    npeaks=peaks_csd.peak_values.shape[-1], return_directions=True
+                )
+                save_nifti(oafd, afd.astype(np.float32), affine)
+                save_nifti(oafd_dirs, afd_dirs.astype(np.float32), affine)
 
             dname_ = Path(opam).parent
             if dname_ == "":
@@ -3519,6 +3547,14 @@ class ReconstForceFlow(Workflow):
         out_entropy="entropy.nii.gz",
         out_predicted_signal="predicted_signal.nii.gz",
         out_pam="peaks.pam5",
+        out_peak_dirs="peak_dirs.nii.gz",
+        out_peak_fiber_fraction="peak_fiber_fraction.nii.gz",
+        out_peak_fiber_density="peak_fiber_density.nii.gz",
+        out_peak_neurite_density="peak_neurite_density.nii.gz",
+        out_peak_axonal_diffusivity="peak_axonal_diffusivity.nii.gz",
+        out_peak_extra_axonal_diffusivity="peak_extra_axonal_diffusivity.nii.gz",
+        out_peak_odi="peak_odi.nii.gz",
+        out_peak_support="peak_support.nii.gz",
         out_micro_uncertainty_dir="microstructure_uncertainty",
         out_micro_ambiguity_dir="microstructure_ambiguity",
     ):
@@ -3604,7 +3640,10 @@ class ReconstForceFlow(Workflow):
         save_metrics : variable string, optional
             List of metrics to save. Possible values: fa, md, rd, wm_fraction,
             gm_fraction, csf_fraction, num_fibers, dispersion, nd, ufa, uncertainty,
-            ambiguity, mk, ak, rk, kfa, entropy, predicted_signal.
+            ambiguity, mk, ak, rk, kfa, entropy, predicted_signal, peak_dirs,
+            peak_fiber_fraction, peak_fiber_density, peak_neurite_density,
+            peak_axonal_diffusivity, peak_extra_axonal_diffusivity, peak_odi,
+            peak_support.
             If not set, all available metrics are saved.
         verbose : bool, optional
             Whether to print verbose messages during processing.
@@ -3648,6 +3687,37 @@ class ReconstForceFlow(Workflow):
             Name of the predicted signal volume to be saved.
         out_pam : string, optional
             Name of the peaks file to be saved (in .pam5 format).
+        out_peak_dirs : string, optional
+            Name of the per-peak directions volume to be saved, shape
+            (X, Y, Z, 5, 3), in the same frame and slot order as the
+            ``peak_dirs`` of ``out_pam``. Without ``use_exact`` the peaks are
+            posterior fixels pooled from the fibers of all neighbors and the
+            per-peak metrics are posterior means; with ``use_exact`` they are
+            the fibers of the best match. Peaks are sorted by decreasing fiber
+            fraction; empty slots are zero. Every ``out_peak_*`` map below
+            follows this slot order.
+        out_peak_fiber_fraction : string, optional
+            Name of the per-peak fiber fraction volume to be saved, shape
+            (X, Y, Z, 5).
+        out_peak_fiber_density : string, optional
+            Name of the per-peak fiber density (intra-axonal volume fraction of
+            the voxel) volume to be saved, shape (X, Y, Z, 5).
+        out_peak_neurite_density : string, optional
+            Name of the per-peak neurite density volume to be saved, shape
+            (X, Y, Z, 5).
+        out_peak_axonal_diffusivity : string, optional
+            Name of the per-peak axonal diffusivity volume to be saved, shape
+            (X, Y, Z, 5).
+        out_peak_extra_axonal_diffusivity : string, optional
+            Name of the per-peak extra-axonal perpendicular diffusivity volume to
+            be saved, shape (X, Y, Z, 5).
+        out_peak_odi : string, optional
+            Name of the per-peak orientation dispersion index volume to be
+            saved, shape (X, Y, Z, 5).
+        out_peak_support : string, optional
+            Name of the per-peak posterior support volume to be saved, shape
+            (X, Y, Z, 5): the posterior weight of the neighbors with a fiber in
+            each fixel. Not saved with ``use_exact``.
         out_micro_uncertainty_dir : string, optional
             Name of the subdirectory for per-microstructure uncertainty maps
             (weighted IQR of posterior density, normalized by prior range).
@@ -3664,7 +3734,7 @@ class ReconstForceFlow(Workflow):
         .. footbibliography::
 
         """
-        from dipy.reconst.force import MICRO_PARAMS, FORCEModel
+        from dipy.reconst.force import MICRO_PARAMS, PEAK_METRICS, FORCEModel
         from dipy.sims.force import get_default_diffusivity_config
         from dipy.utils.optpkg import optional_package
 
@@ -3744,6 +3814,14 @@ class ReconstForceFlow(Workflow):
             oentropy,
             opredicted_signal,
             opeaks,
+            opeak_dirs,
+            opeak_fiber_fraction,
+            opeak_fiber_density,
+            opeak_neurite_density,
+            opeak_axonal_diffusivity,
+            opeak_extra_axonal_diffusivity,
+            opeak_odi,
+            opeak_support,
             omicro_unc_dir,
             omicro_amb_dir,
         ) in io_it:
@@ -3822,36 +3900,62 @@ class ReconstForceFlow(Workflow):
                 conditional_metrics.extend(["mk", "ak", "rk", "kfa"])
             if use_posterior:
                 conditional_metrics.append("entropy")
+            # Per-peak maps exist only if the library has per-fiber metadata.
+            fitted = force_fit.fit_array[force_fit.mask]
+            if fitted.size and fitted[0].peak_dirs is not None:
+                conditional_metrics.append("peak_dirs")
+                conditional_metrics.extend(f"peak_{m}" for m in PEAK_METRICS)
+                if fitted[0].peak_support is not None:
+                    conditional_metrics.append("peak_support")
 
             metrics_to_save = save_metrics or (always_metrics + conditional_metrics)
 
+            # Fit attributes are only assembled into volumes when saved.
             output_map = {
-                "fa": (ofa, force_fit.fa),
-                "md": (omd, force_fit.md),
-                "rd": (ord_, force_fit.rd),
-                "wm_fraction": (owm_fraction, force_fit.wm_fraction),
-                "gm_fraction": (ogm_fraction, force_fit.gm_fraction),
-                "csf_fraction": (ocsf_fraction, force_fit.csf_fraction),
-                "num_fibers": (onum_fibers, force_fit.num_fibers),
-                "dispersion": (odispersion, force_fit.dispersion),
-                "nd": (ond, force_fit.nd),
-                "ufa": (oufa, force_fit.ufa_voxel),
-                "uncertainty": (ouncertainty, force_fit.uncertainty),
-                "ambiguity": (oambiguity, force_fit.ambiguity),
-                "mk": (omk, force_fit.mk),
-                "ak": (oak, force_fit.ak),
-                "rk": (ork, force_fit.rk),
-                "kfa": (okfa, force_fit.kfa),
-                "entropy": (oentropy, force_fit.entropy),
-                "predicted_signal": (opredicted_signal, force_fit.predicted_signal),
+                "fa": (ofa, "fa"),
+                "md": (omd, "md"),
+                "rd": (ord_, "rd"),
+                "wm_fraction": (owm_fraction, "wm_fraction"),
+                "gm_fraction": (ogm_fraction, "gm_fraction"),
+                "csf_fraction": (ocsf_fraction, "csf_fraction"),
+                "num_fibers": (onum_fibers, "num_fibers"),
+                "dispersion": (odispersion, "dispersion"),
+                "nd": (ond, "nd"),
+                "ufa": (oufa, "ufa_voxel"),
+                "uncertainty": (ouncertainty, "uncertainty"),
+                "ambiguity": (oambiguity, "ambiguity"),
+                "mk": (omk, "mk"),
+                "ak": (oak, "ak"),
+                "rk": (ork, "rk"),
+                "kfa": (okfa, "kfa"),
+                "entropy": (oentropy, "entropy"),
+                "predicted_signal": (opredicted_signal, "predicted_signal"),
+                "peak_dirs": (opeak_dirs, "peak_dirs"),
+                "peak_fiber_fraction": (opeak_fiber_fraction, "peak_fiber_fraction"),
+                "peak_fiber_density": (opeak_fiber_density, "peak_fiber_density"),
+                "peak_neurite_density": (
+                    opeak_neurite_density,
+                    "peak_neurite_density",
+                ),
+                "peak_axonal_diffusivity": (
+                    opeak_axonal_diffusivity,
+                    "peak_axonal_diffusivity",
+                ),
+                "peak_extra_axonal_diffusivity": (
+                    opeak_extra_axonal_diffusivity,
+                    "peak_extra_axonal_diffusivity",
+                ),
+                "peak_odi": (opeak_odi, "peak_odi"),
+                "peak_support": (opeak_support, "peak_support"),
             }
 
             for metric in metrics_to_save:
                 if metric not in output_map:
                     logger.warning(f"Unknown metric '{metric}', skipping.")
                     continue
-                out_path, data_arr = output_map[metric]
-                if data_arr is None:
+                out_path, attr = output_map[metric]
+                data_arr = getattr(force_fit, attr)
+                if data_arr is None or data_arr.dtype == object:
                     logger.warning(
                         f"Metric '{metric}' not available for this configuration, "
                         "skipping."

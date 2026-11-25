@@ -22,6 +22,7 @@ from dipy.tracking.streamline import (
     center_streamlines,
     cluster_confidence,
     deform_streamlines,
+    fixel_values_from_volume,
     orient_by_rois,
     orient_by_streamline,
     relist_streamlines,
@@ -1374,3 +1375,87 @@ def test_cluster_confidence():
 
     expected_cci_dist = np.concatenate([cci_p1, np.zeros(1)])
     assert_array_equal(cci_dist, expected_cci_dist)
+
+
+def _crossing_fixels():
+    """3x3x3 volume; every voxel has an x-peak (slot 0, value 1), a y-peak
+    (slot 1, value 2) and an absent slot 2 (value 99)."""
+    shape = (3, 3, 3)
+    dirs = np.zeros(shape + (3, 3))
+    dirs[..., 0, :] = [1, 0, 0]
+    dirs[..., 1, :] = [0, -1, 0]  # sign-flipped
+    data = np.zeros(shape + (3,))
+    data[..., 0] = 1.0
+    data[..., 1] = 2.0
+    data[..., 2] = 99.0
+    return data, dirs
+
+
+def test_fixel_values_crossing():
+    data, dirs = _crossing_fixels()
+    sl_x = np.array([[0, 1, 1], [1, 1, 1], [2, 1, 1]], dtype=float)
+    sl_y = np.array([[1, 2, 1], [1, 1, 1], [1, 0, 1]], dtype=float)  # -y travel
+    out = fixel_values_from_volume(data, dirs, [sl_x, sl_y], np.eye(4))
+    npt.assert_equal(len(out), 2)
+    npt.assert_array_equal(out[0], [1, 1, 1])
+    npt.assert_array_equal(out[1], [2, 2, 2])
+    # Flipped x peak sign gives the same answer; generator input accepted.
+    dirs[..., 0, :] *= -1
+    out = fixel_values_from_volume(data, dirs, (s for s in [sl_x]), np.eye(4))
+    npt.assert_array_equal(out[0], [1, 1, 1])
+
+
+def test_fixel_values_angle_outside_absent():
+    data, dirs = _crossing_fixels()
+    # Along z: 90 degrees from both present peaks; absent slot never chosen.
+    sl_z = np.array([[1, 1, 0], [1, 1, 1], [1, 1, 2]], dtype=float)
+    out = fixel_values_from_volume(data, dirs, [sl_z], np.eye(4))
+    npt.assert_(np.all(np.isnan(out[0])))
+    out = fixel_values_from_volume(data, dirs, [sl_z], np.eye(4), max_angle=90)
+    npt.assert_(np.all(np.isin(out[0], [1, 2])))
+    # 30 degrees off x: accepted at 45, rejected at 20.
+    t = np.array([np.cos(np.pi / 6), np.sin(np.pi / 6), 0]) * 0.4
+    sl = np.array([[1, 1, 1] - t, [1, 1, 1], [1, 1, 1] + t])
+    npt.assert_array_equal(fixel_values_from_volume(data, dirs, [sl], np.eye(4))[0], 1)
+    out = fixel_values_from_volume(data, dirs, [sl], np.eye(4), max_angle=20)
+    npt.assert_(np.all(np.isnan(out[0])))
+    # Points outside the volume -> NaN; voxel with no present peak -> NaN.
+    sl_out = np.array([[-1, 1, 1], [0, 1, 1], [1, 1, 1], [3.6, 1, 1]], dtype=float)
+    dirs[2, 1, 1] = 0
+    out = fixel_values_from_volume(data, dirs, [sl_out], np.eye(4))
+    npt.assert_array_equal(np.isnan(out[0]), [True, False, False, True])
+    out = fixel_values_from_volume(
+        data, dirs, [np.array([[1.0, 1, 1], [2, 1, 1]])], np.eye(4)
+    )
+    npt.assert_array_equal(out[0], [1, np.nan])
+    # Single-point streamline has no tangent.
+    out = fixel_values_from_volume(data, dirs, [np.array([[1.0, 1, 1]])], np.eye(4))
+    npt.assert_(np.isnan(out[0][0]))
+
+
+def test_fixel_values_affine_and_trailing():
+    data, dirs = _crossing_fixels()
+    data = np.stack([data, 10 * data], axis=-1)  # (3, 3, 3, 3, 2)
+    sl_x = np.array([[0, 1, 1], [1, 1, 1], [2, 1, 1]], dtype=float)
+    sl_y = np.array([[1, 0, 2], [1, 1, 2], [1, 2, 2]], dtype=float)
+    ref = fixel_values_from_volume(data, dirs, Streamlines([sl_x, sl_y]), np.eye(4))
+    npt.assert_array_equal(ref[0], [[1, 10]] * 3)
+    npt.assert_array_equal(ref[1], [[2, 20]] * 3)
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    affine[:3, 3] = [-10, 5, 3]
+    world = [s * 2 + affine[:3, 3] for s in (sl_x, sl_y)]
+    out = fixel_values_from_volume(data, dirs, world, affine)
+    for a, b in zip(out, ref):
+        npt.assert_array_equal(a, b)
+
+
+def test_fixel_values_errors():
+    data, dirs = _crossing_fixels()
+    sl = [np.array([[0.0, 1, 1], [1, 1, 1]])]
+    eye = np.eye(4)
+    f = fixel_values_from_volume
+    npt.assert_raises(ValueError, f, data[..., :2], dirs, sl, eye)
+    npt.assert_raises(ValueError, f, data, dirs[..., :2], sl, eye)
+    npt.assert_raises(
+        ValueError, fixel_values_from_volume, data, dirs, sl, np.eye(4), max_angle=91
+    )

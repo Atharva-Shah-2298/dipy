@@ -2,9 +2,11 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 
+from dipy.stats import analysis
 from dipy.stats.analysis import (
     SpectraGrid,
     afq_profile,
+    anatomical_measures,
     buan_profile,
     compute_robust_centroid,
     create_radial_bins,
@@ -221,6 +223,124 @@ def test_buan_profile():
         affine,
         no_disks=10,
     )
+
+
+def _crossing_peaks(shape=(40, 40, 40)):
+    """Two present peaks per voxel: slot 0 along x, slot 1 along y."""
+    peak_dirs = np.zeros(shape + (2, 3))
+    peak_dirs[..., 0, 0] = 1.0
+    peak_dirs[..., 1, 1] = 1.0
+    metric = np.empty(shape + (2,))
+    metric[..., 0] = 2.0
+    metric[..., 1] = 5.0
+    return metric, peak_dirs
+
+
+def _straight_bundle(axis, *, n_pts=20, n_streamlines=10, scale=1.0):
+    """Parallel straight streamlines along ``axis`` in world coordinates."""
+    t = np.linspace(5, 34, n_pts)
+    lines = []
+    for i in range(n_streamlines):
+        pts = np.full((n_pts, 3), 20.0)
+        pts[:, axis] = t
+        pts[:, 2] += 0.1 * i
+        lines.append(pts * scale)
+    return Streamlines(lines)
+
+
+def test_buan_profile_per_peak_crossing():
+    metric, peak_dirs = _crossing_peaks()
+    # x-peak value differs between the two halves of the volume (x < 20 / >= 20)
+    metric[20:, :, :, 0] = 3.0
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+
+    bundle_x = _straight_bundle(0, scale=2.0)
+    profile_x = buan_profile(
+        bundle_x, bundle_x, bundle_x, metric, affine, no_disks=10, peak_dirs=peak_dirs
+    )
+    npt.assert_equal(profile_x.shape, (10,))
+    # Disks follow the model centroid (x from 5 to 34): first half below x=20.
+    npt.assert_almost_equal(profile_x, np.repeat([2.0, 3.0], 5))
+
+    bundle_y = _straight_bundle(1, scale=2.0)
+    profile_y = buan_profile(
+        bundle_y, bundle_y, bundle_y, metric, affine, no_disks=10, peak_dirs=peak_dirs
+    )
+    npt.assert_almost_equal(profile_y, np.full(10, 5.0))
+
+    # Points whose voxel has no peak within max_angle are excluded.
+    profile_y = buan_profile(
+        bundle_y,
+        bundle_y,
+        bundle_y,
+        metric[..., :1],
+        affine,
+        no_disks=10,
+        peak_dirs=peak_dirs[..., :1, :],
+    )
+    npt.assert_equal(np.isnan(profile_y), np.ones(10, dtype=bool))
+
+
+def test_buan_profile_per_peak_shape_errors():
+    metric, peak_dirs = _crossing_peaks()
+    bundle = _straight_bundle(0)
+    affine = np.eye(4)
+    # 4D metric without directions
+    with pytest.raises(ValueError):
+        buan_profile(bundle, bundle, bundle, metric, affine, no_disks=10)
+    # Number of peaks differs between metric and directions
+    with pytest.raises(ValueError):
+        buan_profile(
+            bundle,
+            bundle,
+            bundle,
+            metric[..., :1],
+            affine,
+            no_disks=10,
+            peak_dirs=peak_dirs,
+        )
+    # 3D metric with directions
+    with pytest.raises(ValueError):
+        buan_profile(
+            bundle,
+            bundle,
+            bundle,
+            metric[..., 0],
+            affine,
+            no_disks=10,
+            peak_dirs=peak_dirs,
+        )
+
+
+def test_buan_anatomical_measures_per_peak(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(
+        analysis,
+        "save_buan_profiles_hdf5",
+        lambda fname, dt: saved.update(fname=fname, dt=dt),
+    )
+    metric, peak_dirs = _crossing_peaks()
+    # No peak in voxels with x >= 25: points there carry no value.
+    peak_dirs[25:] = 0
+    # Voxel-space bundle running along y, then one along x reaching x >= 25.
+    bundle = Streamlines([_straight_bundle(1)[0], _straight_bundle(0)[0]])
+    ind = np.arange(40) % 10
+
+    anatomical_measures(
+        bundle, metric, {}, "peak_v", "AF_L", "s1", 1, ind, "out", peak_dirs=peak_dirs
+    )
+
+    dt = saved["dt"]
+    x_vox = np.round(_straight_bundle(0)[0][:, 0])
+    kept = np.concatenate([np.ones(20, dtype=bool), x_vox < 25])
+    npt.assert_equal(str(saved["fname"]).endswith("AF_L_peak_v"), True)
+    npt.assert_almost_equal(
+        dt["peak_v"], np.concatenate([np.full(20, 5.0), np.full(kept[20:].sum(), 2.0)])
+    )
+    npt.assert_equal(dt["disk"], ind[kept] + 1)
+    npt.assert_equal(dt["streamline"], np.repeat([0, 1], 20)[kept])
+    npt.assert_equal(len(dt["subject"]), kept.sum())
+    npt.assert_equal(len(dt["group"]), kept.sum())
 
 
 def test_compute_robust_centroid():

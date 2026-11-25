@@ -257,6 +257,21 @@ def _generate_batch_worker(
         f_ins_path,
         f_ins_shape,
         f_ins_dtype,
+        fiber_indices_path,
+        fiber_indices_shape,
+        fiber_indices_dtype,
+        wm_d_perp_extra_path,
+        wm_d_perp_extra_shape,
+        wm_d_perp_extra_dtype,
+        fiber_d_par_path,
+        fiber_d_par_shape,
+        fiber_d_par_dtype,
+        fiber_d_perp_extra_path,
+        fiber_d_perp_extra_shape,
+        fiber_d_perp_extra_dtype,
+        fiber_disp_path,
+        fiber_disp_shape,
+        fiber_disp_dtype,
     ) = memmap_info
 
     # Apply diffusivity ranges in worker
@@ -314,6 +329,30 @@ def _generate_batch_worker(
         csf_d_par_path, mode="r+", dtype=csf_d_par_dtype, shape=csf_d_par_shape
     )
     f_ins_mm = np.memmap(f_ins_path, mode="r+", dtype=f_ins_dtype, shape=f_ins_shape)
+    fiber_indices_mm = np.memmap(
+        fiber_indices_path,
+        mode="r+",
+        dtype=fiber_indices_dtype,
+        shape=fiber_indices_shape,
+    )
+    wm_d_perp_extra_mm = np.memmap(
+        wm_d_perp_extra_path,
+        mode="r+",
+        dtype=wm_d_perp_extra_dtype,
+        shape=wm_d_perp_extra_shape,
+    )
+    fiber_d_par_mm = np.memmap(
+        fiber_d_par_path, mode="r+", dtype=fiber_d_par_dtype, shape=fiber_d_par_shape
+    )
+    fiber_d_perp_extra_mm = np.memmap(
+        fiber_d_perp_extra_path,
+        mode="r+",
+        dtype=fiber_d_perp_extra_dtype,
+        shape=fiber_d_perp_extra_shape,
+    )
+    fiber_disp_mm = np.memmap(
+        fiber_disp_path, mode="r+", dtype=fiber_disp_dtype, shape=fiber_disp_shape
+    )
 
     for i in range(batch_size):
         idx = start_idx + i
@@ -349,6 +388,11 @@ def _generate_batch_worker(
             gm_d_par_mm[idx],
             csf_d_par_mm[idx],
             f_ins_mm[idx],
+            fiber_indices_mm[idx],
+            wm_d_perp_extra_mm[idx],
+            fiber_d_par_mm[idx],
+            fiber_d_perp_extra_mm[idx],
+            fiber_disp_mm[idx],
         ) = res
 
     # Flush memmaps
@@ -371,6 +415,11 @@ def _generate_batch_worker(
         gm_d_par_mm,
         csf_d_par_mm,
         f_ins_mm,
+        fiber_indices_mm,
+        wm_d_perp_extra_mm,
+        fiber_d_par_mm,
+        fiber_d_perp_extra_mm,
+        fiber_disp_mm,
     ]:
         mm.flush()
 
@@ -592,6 +641,12 @@ def generate_force_simulations(
     gm_d_par_mm = create_mm("gm_d_par", dtype, (num_simulations,))
     csf_d_par_mm = create_mm("csf_d_par", dtype, (num_simulations,))
     f_ins_mm = create_mm("f_ins", dtype, (num_simulations, 3))
+    fiber_indices_mm = create_mm("fiber_indices", np.int16, (num_simulations, 3))
+    wm_d_perp_extra_mm = create_mm("wm_d_perp_extra", dtype, (num_simulations,))
+    # Per-fiber parameters (zero for absent fibers), aligned with f_ins.
+    fiber_d_par_mm = create_mm("fiber_d_par", dtype, (num_simulations, 3))
+    fiber_d_perp_extra_mm = create_mm("fiber_d_perp_extra", dtype, (num_simulations, 3))
+    fiber_disp_mm = create_mm("fiber_disp", dtype, (num_simulations, 3))
 
     memmaps = [
         signals_mm,
@@ -612,6 +667,11 @@ def generate_force_simulations(
         gm_d_par_mm,
         csf_d_par_mm,
         f_ins_mm,
+        fiber_indices_mm,
+        wm_d_perp_extra_mm,
+        fiber_d_par_mm,
+        fiber_d_perp_extra_mm,
+        fiber_disp_mm,
     ]
 
     # Build batch specs
@@ -686,6 +746,21 @@ def generate_force_simulations(
         (num_simulations,),
         dtype,
         memmap_paths["f_ins"],
+        (num_simulations, 3),
+        dtype,
+        memmap_paths["fiber_indices"],
+        (num_simulations, 3),
+        np.int16,
+        memmap_paths["wm_d_perp_extra"],
+        (num_simulations,),
+        dtype,
+        memmap_paths["fiber_d_par"],
+        (num_simulations, 3),
+        dtype,
+        memmap_paths["fiber_d_perp_extra"],
+        (num_simulations, 3),
+        dtype,
+        memmap_paths["fiber_disp"],
         (num_simulations, 3),
         dtype,
     )
@@ -883,6 +958,14 @@ def generate_force_simulations(
         "ufa_wm": np.array(ufa_wm_mm),
         "ufa_voxel": np.array(ufa_voxel_mm),
         "fraction_array": np.array(fraction_array_mm),
+        "fiber_indices": np.array(fiber_indices_mm),
+        "f_ins": np.array(f_ins_mm),
+        "wm_disp": np.array(wm_disp_mm),
+        "wm_d_par": np.array(wm_d_par_mm),
+        "wm_d_perp_extra": np.array(wm_d_perp_extra_mm),
+        "fiber_d_par": np.array(fiber_d_par_mm),
+        "fiber_d_perp_extra": np.array(fiber_d_perp_extra_mm),
+        "fiber_disp": np.array(fiber_disp_mm),
     }
 
     if compute_dki:

@@ -75,3 +75,57 @@ def test_fmls_afd():
         fmls_afd(odf, order, weights, adj_indptr, adj_indices + 2, 4, 0, 0)
     with assert_raises(ValueError):
         fmls_afd(odf, order, weights[:-1], adj_indptr, adj_indices, 4, 0, 0)
+
+
+def test_fmls_afd_indices():
+    # Same path graph as test_fmls_afd
+    adj_indptr = np.array([0, 1, 4, 6, 7, 8, 8], dtype=np.intp)
+    adj_indices = np.array([1, 0, 2, 4, 1, 3, 2, 1], dtype=np.intp)
+    weights = np.array([1, 2, 1, 1, 1, 1], dtype=float)
+    odf = np.array(
+        [
+            [3.0, 1.0, 2.0, 0.5, 0.9, -0.2],
+            # The peak of the second lobe moves from direction 2 to 3
+            [3.0, 1.0, 1.5, 2.0, 0.9, -0.2],
+            [3.0, 1.0, 2.0, 0.5, 0.9, -3.5],
+        ]
+    )
+    order = np.argsort(-odf, axis=-1, kind="stable")
+
+    afd, indices = fmls_afd(
+        odf, order, weights, adj_indptr, adj_indices, 4, 0, 0, return_indices=True
+    )
+    assert_array_equal(
+        afd, fmls_afd(odf, order, weights, adj_indptr, adj_indices, 4, 0, 0)
+    )
+    assert_array_equal(afd[:2], [[5.0, 2.5, 0.9, 0], [5.0, 3.5, 0.9, 0]])
+    # Each lobe points to its largest direction, in the order of afd
+    assert_array_equal(indices, [[0, 2, 4, -1], [0, 3, 4, -1], [-1, -1, -1, -1]])
+    assert_equal(indices.dtype, np.intp)
+
+    # Discarded lobes leave no index behind
+    afd, indices = fmls_afd(
+        odf[:1],
+        order[:1],
+        weights,
+        adj_indptr,
+        adj_indices,
+        4,
+        1,
+        0,
+        return_indices=True,
+    )
+    assert_array_equal(afd, [[5.0, 2.5, 0, 0]])
+    assert_array_equal(indices, [[0, 2, -1, -1]])
+    afd, indices = fmls_afd(
+        odf[:1],
+        order[:1],
+        weights,
+        adj_indptr,
+        adj_indices,
+        2,
+        0,
+        0,
+        return_indices=True,
+    )
+    assert_array_equal(indices, [[0, 2]])

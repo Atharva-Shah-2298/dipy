@@ -707,6 +707,43 @@ def test_SphHarmFit_afd():
     npt.assert_allclose(afd_first, afd[:1])
 
 
+def test_SphHarmFit_afd_directions():
+    # Two Watson lobes crossing at 90 degrees along oblique axes; the second
+    # voxel swaps the fractions so the larger lobe changes axis.
+    _, gtab, _ = make_fake_signal()
+    sphere = hemi_icosahedron.subdivide(n=5)
+    axes = np.array([[1, 1, 1], [1, -1, 0]]) / np.array([[np.sqrt(3)], [np.sqrt(2)]])
+    lobes = np.exp(5 * ((sphere.vertices @ axes.T) ** 2 - 1))
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=descoteaux07_legacy_msg,
+            category=PendingDeprecationWarning,
+        )
+        model = QballModel(gtab, sh_order_max=8)
+        coef = sf_to_sh(
+            np.stack([lobes @ [0.7, 0.3], lobes @ [0.3, 0.7]]),
+            sphere,
+            sh_order_max=8,
+        )
+        coef = np.concatenate([coef, -coef[:1]])
+        fit = SphHarmFit(model, coef.reshape(3, 1, -1), None)
+        afd, directions = fit.afd(npeaks=3, return_directions=True)
+        afd_only = fit.afd(npeaks=3)
+
+    assert_equal(directions.shape, (3, 1, 3, 3))
+    assert_array_equal(afd, afd_only)
+    # Slot k holds the axis of the lobe whose AFD is afd[..., k].
+    for voxel, expected in ((0, axes), (1, axes[::-1])):
+        assert afd[voxel, 0, 0] > afd[voxel, 0, 1] > 0
+        cos = np.abs(np.sum(directions[voxel, 0, :2] * expected, axis=-1))
+        npt.assert_array_less(np.cos(np.deg2rad(3)), cos)
+        npt.assert_allclose(np.linalg.norm(directions[voxel, 0, :2], axis=-1), 1)
+    # Missing lobes have no direction
+    assert_array_equal(directions[:2, 0, 2], 0)
+    assert_array_equal(directions[2], 0)
+
+
 class TestOpdtModel(TestQballModel):
     model = OpdtModel
 

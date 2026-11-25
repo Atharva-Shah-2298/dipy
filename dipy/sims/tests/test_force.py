@@ -341,6 +341,77 @@ def test_generate_force_simulations_default_min_crossing_angles():
     assert three.min() >= 60.0
 
 
+@pytest.mark.parametrize("tortuosity", [False, True])
+def test_generate_force_simulations_fiber_metadata(tortuosity):
+    """Per-fiber indices, fractions and intra-axonal fractions stay aligned."""
+    from dipy.sims.force import generate_force_simulations
+
+    # Nearly undispersed lobes: the ODF at each fiber scales with its fraction.
+    sims = generate_force_simulations(
+        _make_gtab([1000, 2000]),
+        num_simulations=300,
+        batch_size=100,
+        num_cpus=1,
+        odi_range=(0.01, 0.02),
+        tortuosity=tortuosity,
+        verbose=False,
+    )
+    indices = sims["fiber_indices"]
+    fractions = sims["fraction_array"]
+    intra = sims["f_ins"]
+    has_fibers = sims["wm_fraction"] > 0.5
+    assert indices.shape == (300, 3) and np.any(has_fibers) and np.any(~has_fibers)
+
+    same_disp = 0
+    for sim in range(300):
+        present = indices[sim] >= 0
+        assert set(indices[sim][present]) == set(np.flatnonzero(sims["labels"][sim]))
+        n_fibers = int(sims["num_fibers"][sim])
+        assert present.sum() == (n_fibers if has_fibers[sim] else 0)
+        if not present.any():
+            continue
+        # ODF peak heights follow the fractions only if the fibers share
+        # their dispersion; a more dispersed fiber has a lower peak.
+        if np.ptp(sims["fiber_disp"][sim][:n_fibers]) > 0:
+            continue
+        same_disp += 1
+        odf = sims["odfs"][sim].astype(float)[indices[sim][present]]
+        np.testing.assert_allclose(
+            odf / odf.sum(),
+            fractions[sim][present] / fractions[sim][present].sum(),
+            atol=0.02,
+        )
+    assert same_disp > 0
+
+    # Fractions and intra-axonal fractions follow the same fiber order.
+    np.testing.assert_allclose(
+        sims["nd"], sims["wm_fraction"] * np.sum(fractions * intra, axis=1), rtol=1e-5
+    )
+    # Every fiber has its own parameters (zero for absent fibers); the scalar
+    # WM values are their fraction-weighted means.
+    n_fib = sims["num_fibers"].astype(int)
+    absent = np.arange(3)[None] >= n_fib[:, None]
+    for per_fiber, scalar in (
+        ("fiber_d_par", "wm_d_par"),
+        ("fiber_d_perp_extra", "wm_d_perp_extra"),
+        ("fiber_disp", "wm_disp"),
+    ):
+        assert sims[per_fiber].shape == (300, 3)
+        assert np.all(sims[per_fiber][absent] == 0)
+        np.testing.assert_allclose(
+            sims[scalar], np.sum(fractions * sims[per_fiber], axis=1), rtol=1e-5
+        )
+    multi = n_fib >= 2
+    assert np.any(sims["fiber_d_par"][multi, 0] != sims["fiber_d_par"][multi, 1])
+    d_par, d_perp = sims["fiber_d_par"][~absent], sims["fiber_d_perp_extra"][~absent]
+    if tortuosity:
+        expected = d_par * (1 - intra[~absent]) / (1 + intra[~absent])
+        np.testing.assert_allclose(d_perp, expected, rtol=1e-5)
+    else:
+        assert np.all(d_perp >= 0.3e-3)
+        assert np.all(d_perp <= 1.5e-3)
+
+
 def test_generate_force_simulations_relaxed_min_crossing_angles():
     """Lowering the limits lets shallow crossings into the library."""
     from dipy.sims.force import generate_force_simulations

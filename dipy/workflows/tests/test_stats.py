@@ -20,6 +20,7 @@ from dipy.workflows.stats import (
     BundleShapeAnalysis,
     LinearMixedModelsFlow,
     SNRinCCFlow,
+    _match_peak_dirs_prefix,
     buan_bundle_profiles,
 )
 
@@ -324,6 +325,118 @@ def test_bundle_analysis_tractometry_flow_single_subject(tmp_path, rng=None):
     ba_flow.run(mb, single_sub, out_dir=out_dir)
 
     assert_true(Path(out_dir / "temp_fa_profile.npy").exists())
+
+
+def _write_per_peak_subject(root):
+    """Write bundles along x and a metric folder mixing 3D and per-peak maps.
+
+    ``peak_v`` uses ``peak_dirs`` (slot 0 along x carries 2, slot 1 along y
+    carries 5). ``peak_v_w`` matches both ``peak_dirs`` and ``peak_v_w_dirs``;
+    the latter has the slots swapped so that the x-peak carries 7.
+    """
+    shape = (40, 40, 40)
+    affine = np.eye(4)
+    for name in ("model_bundles", "rec_bundles", "org_bundles", "anatomical_measures"):
+        os.mkdir(root / name)
+    measures = root / "anatomical_measures"
+
+    save_nifti(measures / "fa.nii.gz", np.full(shape, 0.5), affine)
+
+    dirs = np.zeros(shape + (2, 3))
+    dirs[..., 0, 0] = 1.0
+    dirs[..., 1, 1] = 1.0
+    save_nifti(measures / "peak_dirs.nii.gz", dirs, affine)
+    save_nifti(measures / "peak_v_w_dirs.nii.gz", dirs[..., ::-1, :], affine)
+
+    values = np.empty(shape + (2,))
+    values[..., 0], values[..., 1] = 2.0, 5.0
+    save_nifti(measures / "peak_v.nii.gz", values, affine)
+    values[..., 0], values[..., 1] = 3.0, 7.0
+    save_nifti(measures / "peak_v_w.nii.gz", values, affine)
+    save_nifti(measures / "other_v.nii.gz", values, affine)
+
+    t = np.linspace(5, 34, 20)
+    lines = []
+    for i in range(10):
+        pts = np.full((20, 3), 20.0)
+        pts[:, 0] = t
+        pts[:, 2] += 0.1 * i
+        lines.append(pts)
+    for name in ("model_bundles", "rec_bundles", "org_bundles"):
+        sft = StatefulTractogram(
+            Streamlines(lines), measures / "fa.nii.gz", Space.RASMM
+        )
+        save_tractogram(sft, root / name / "temp.trk", bbox_valid_check=False)
+
+
+def test_match_peak_dirs_prefix():
+    prefixes = ["force", "force_peak", "peak", "afd"]
+    npt.assert_equal(_match_peak_dirs_prefix("force_peak_odi", prefixes), "force_peak")
+    npt.assert_equal(_match_peak_dirs_prefix("force_peakodi", prefixes), "force")
+    npt.assert_equal(_match_peak_dirs_prefix("afd", prefixes), "afd")
+    npt.assert_equal(_match_peak_dirs_prefix("peak_odi", prefixes), "peak")
+    assert _match_peak_dirs_prefix("afd2", prefixes) is None
+    assert _match_peak_dirs_prefix("csd_afd", prefixes) is None
+
+
+def test_bundle_analysis_tractometry_flow_single_subject_per_peak(tmp_path):
+    subject = tmp_path / "10001"
+    os.mkdir(subject)
+    _write_per_peak_subject(subject)
+    out_dir = tmp_path / "output"
+
+    BundleAnalysisTractometryFlow().run(
+        subject / "model_bundles", subject, no_disks=10, out_dir=out_dir
+    )
+
+    npt.assert_equal(
+        sorted(p.name for p in out_dir.iterdir()),
+        [
+            "temp_fa_profile.npy",
+            "temp_peak_v_profile.npy",
+            "temp_peak_v_w_profile.npy",
+        ],
+    )
+    npt.assert_almost_equal(np.load(out_dir / "temp_fa_profile.npy"), np.full(10, 0.5))
+    # Bundle runs along x: the x-peak value is sampled.
+    npt.assert_almost_equal(
+        np.load(out_dir / "temp_peak_v_profile.npy"), np.full(10, 2.0)
+    )
+    # Longest prefix wins: peak_v_w uses peak_v_w_dirs (x-peak in slot 1).
+    npt.assert_almost_equal(
+        np.load(out_dir / "temp_peak_v_w_profile.npy"), np.full(10, 7.0)
+    )
+
+
+@pytest.mark.skipif(
+    not have_pandas or not have_tables, reason="Requires Pandas and PyTables"
+)
+def test_buan_bundle_profiles_per_peak(tmp_path):
+    _write_per_peak_subject(tmp_path)
+    out_dir = tmp_path / "output"
+    os.mkdir(out_dir)
+
+    buan_bundle_profiles(
+        tmp_path / "model_bundles",
+        tmp_path / "rec_bundles",
+        tmp_path / "org_bundles",
+        tmp_path / "anatomical_measures",
+        group_id=1,
+        subject="10001",
+        no_disks=10,
+        out_dir=out_dir,
+    )
+
+    npt.assert_equal(
+        sorted(p.name for p in out_dir.iterdir()),
+        ["temp_fa.h5", "temp_peak_v.h5", "temp_peak_v_w.h5"],
+    )
+    for name, expected in (("fa", 0.5), ("peak_v", 2.0), ("peak_v_w", 7.0)):
+        df = pd.read_hdf(out_dir / f"temp_{name}.h5")
+        npt.assert_equal(len(df), 200)
+        npt.assert_almost_equal(df[name].to_numpy(), expected)
+        npt.assert_equal(df["streamline"].to_numpy(), np.repeat(np.arange(10), 20))
+        npt.assert_equal(set(df["disk"]), set(range(1, 11)))
 
 
 @pytest.mark.skipif(

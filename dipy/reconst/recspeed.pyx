@@ -474,13 +474,16 @@ cdef cnp.npy_intp _fmls_afd_voxel(
     double integral_threshold,
     cnp.npy_intp[::1] labels,
     double[::1] peaks,
+    cnp.npy_intp[::1] peak_dirs,
     double[::1] integrals,
     double[::1] afd,
+    cnp.npy_intp[::1] indices,
 ) noexcept nogil:
     """Segment one FOD with FMLS and write the integral of each lobe.
 
-    Returns the number of lobes written to `afd`, or -1 if `order` holds an
-    index out of range.
+    The direction index of each written lobe's peak goes to `indices`. Returns
+    the number of lobes written to `afd`, or -1 if `order` holds an index out
+    of range.
     """
     cdef:
         cnp.npy_intp n_dirs = odf.shape[0]
@@ -526,6 +529,7 @@ cdef cnp.npy_intp _fmls_afd_voxel(
             lobe = n_lobes
             n_lobes += 1
             peaks[lobe] = value
+            peak_dirs[lobe] = idx
             integrals[lobe] = 0
             labels[idx] = lobe
         elif not shared:
@@ -538,6 +542,7 @@ cdef cnp.npy_intp _fmls_afd_voxel(
             break
         if integrals[lobe] >= integral_threshold and peaks[lobe] >= peak_threshold:
             afd[n_out] = integrals[lobe]
+            indices[n_out] = peak_dirs[lobe]
             n_out += 1
     return n_out
 
@@ -553,6 +558,8 @@ def fmls_afd(
     cnp.npy_intp npeaks,
     double peak_threshold,
     double integral_threshold,
+    *,
+    bint return_indices=False,
 ):
     """Apparent fiber density of the FOD lobes found by FMLS segmentation.
 
@@ -580,12 +587,18 @@ def fmls_afd(
         Lobes whose maximum amplitude is below this value are discarded.
     integral_threshold : double
         Lobes whose integral is below this value are discarded.
+    return_indices : bool, optional
+        Also return the direction index of each lobe's peak.
 
     Returns
     -------
     afd : ndarray (N, npeaks)
         AFD of each lobe, sorted by descending peak amplitude. Missing lobes
         are set to 0.
+    indices : ndarray (N, npeaks), dtype=intp
+        Index of the direction of largest amplitude of each lobe in `afd`.
+        Missing lobes are set to -1. Only returned if `return_indices` is
+        True.
 
     References
     ----------
@@ -598,8 +611,10 @@ def fmls_afd(
         cnp.npy_intp n_out = 0
         cnp.npy_intp[::1] labels
         double[::1] peaks
+        cnp.npy_intp[::1] peak_dirs
         double[::1] integrals
         double[:, ::1] afd
+        cnp.npy_intp[:, ::1] indices
 
     if order.shape[0] != n_vox or order.shape[1] != n_dirs:
         raise ValueError("order must have the same shape as odf")
@@ -625,21 +640,25 @@ def fmls_afd(
 
     labels = np.empty(n_dirs, dtype=np.intp)
     peaks = np.empty(n_dirs, dtype=float)
+    peak_dirs = np.empty(n_dirs, dtype=np.intp)
     integrals = np.empty(n_dirs, dtype=float)
     afd = np.zeros((n_vox, npeaks), dtype=float)
+    indices = np.full((n_vox, npeaks), -1, dtype=np.intp)
 
     with nogil:
         for v in range(n_vox):
             n_out = _fmls_afd_voxel(
                 odf[v], order[v], weights, adj_indptr, adj_indices,
-                peak_threshold, integral_threshold, labels, peaks, integrals,
-                afd[v]
+                peak_threshold, integral_threshold, labels, peaks, peak_dirs,
+                integrals, afd[v], indices[v]
             )
             if n_out < 0:
                 break
 
     if n_out < 0:
         raise IndexError("Values in order must be < number of directions")
+    if return_indices:
+        return np.asarray(afd), np.asarray(indices)
     return np.asarray(afd)
 
 

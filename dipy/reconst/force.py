@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -140,10 +141,16 @@ def _load_cache_registry(cache_dir):
 
 
 def _save_cache_registry(cache_dir, registry):
-    """Persist *registry* as JSON in *cache_dir*."""
+    """Persist *registry* as JSON in *cache_dir*.
+
+    Written to a temporary file and renamed, so readers never see a partial
+    registry (and a full disk cannot leave a truncated one behind).
+    """
     registry_path = cache_dir / "cache_registry.json"
-    with open(registry_path, "w") as f:
+    tmp = cache_dir / f".cache_registry.{os.getpid()}.json"
+    with open(tmp, "w") as f:
         json.dump(registry, f, indent=2)
+    os.replace(tmp, registry_path)
 
 
 def _locked_registry_update(cache_dir, update_fn):
@@ -269,6 +276,12 @@ def _find_cached_simulation(
     registry = _load_cache_registry(cache_dir)
     legacy_seed_cache_reported = False
     for entry in registry:
+        # Libraries cached before per-fiber metadata and per-fiber parameters
+        # were stored cannot provide per-peak metrics, so they are regenerated.
+        if not entry.get("fiber_metadata", False):
+            continue
+        if not entry.get("per_fiber_params", False):
+            continue
         if entry["num_simulations"] != num_simulations:
             continue
         if not _gtab_matches(entry["bvals"], entry["bvecs"], gtab):
@@ -355,6 +368,8 @@ def _register_cached_simulation(
         "two_fiber_min_angle": float(min_crossing_angles[0]),
         "three_fiber_min_angle": float(min_crossing_angles[1]),
         "seed": None if seed is None else int(seed),
+        "fiber_metadata": True,
+        "per_fiber_params": True,
         "filename": filename,
     }
 
@@ -744,6 +759,356 @@ def postprocess_peaks(preds, target_sphere, fracs):
     return peaks_output, peak_indices, peak_vals
 
 
+# Per-peak metrics, exposed by FORCEFit as ``peak_<name>``.
+PEAK_METRICS = (
+    "fiber_fraction",
+    "fiber_density",
+    "neurite_density",
+    "axonal_diffusivity",
+    "extra_axonal_diffusivity",
+    "odi",
+)
+
+
+def _peak_params(lib_idx, d, *, npeaks=5):
+    """Per-peak directions and metrics of the best-match simulations.
+
+    Parameters
+    ----------
+    lib_idx : ndarray (N,)
+        Library indices of the best match per voxel.
+    d : dict
+        Simulation dictionary.
+    npeaks : int, optional
+        Number of peak slots, matching ``PeaksAndMetrics``.
+
+    Returns
+    -------
+    params : dict of ndarray
+        ``peak_indices`` (N, npeaks), ``peak_dirs`` (N, npeaks, 3) and one
+        (N, npeaks) array per entry of ``PEAK_METRICS``, prefixed by ``peak_``.
+        Peaks are sorted by decreasing fiber fraction; empty slots have index
+        -1 and zero direction and metrics. Empty if the library predates the
+        per-fiber metadata.
+    """
+    from dipy.sims.force import default_sphere
+
+    if "fiber_indices" not in d or "fiber_d_par" not in d:
+        return {}
+    indices = d["fiber_indices"][lib_idx].astype(np.int32)
+    fractions = d["fraction_array"][lib_idx]
+    present = indices >= 0
+    order = np.argsort(np.where(present, -fractions, np.inf), axis=1, kind="stable")
+    indices = np.take_along_axis(indices, order, axis=1)
+    fractions = np.take_along_axis(fractions, order, axis=1)
+    intra = np.take_along_axis(d["f_ins"][lib_idx], order, axis=1)
+    present = np.take_along_axis(present, order, axis=1)
+
+    n_vox, n_fibers = indices.shape
+    peak_indices = np.full((n_vox, npeaks), -1, dtype=np.int32)
+    peak_indices[:, :n_fibers] = np.where(present, indices, -1)
+    peak_dirs = np.zeros((n_vox, npeaks, 3), dtype=np.float32)
+    peak_dirs[:, :n_fibers][present] = default_sphere.vertices[indices[present]]
+    params = {"peak_indices": peak_indices, "peak_dirs": peak_dirs}
+
+    # Every fiber of a simulation has its own diffusivities and dispersion.
+    def per_fiber(name):
+        return np.take_along_axis(d[name][lib_idx], order, axis=1)
+
+    values = {
+        "fiber_fraction": fractions,
+        "fiber_density": d["wm_fraction"][lib_idx, None] * fractions * intra,
+        "neurite_density": intra,
+        "axonal_diffusivity": per_fiber("fiber_d_par"),
+        "extra_axonal_diffusivity": per_fiber("fiber_d_perp_extra"),
+        "odi": per_fiber("fiber_disp"),
+    }
+    for name in PEAK_METRICS:
+        out = np.zeros((n_vox, npeaks), dtype=np.float32)
+        out[:, :n_fibers] = np.where(present, values[name], 0)
+        params[f"peak_{name}"] = out
+    return params
+
+
+# Sources of the per-peak (fixel) parameters in posterior mode.
+PEAK_SOURCES = ("fibers", "odf", "hybrid", "best_match")
+# Axial smoothing kernel of the posterior fiber density on ``default_sphere``:
+# ``exp(-sin(theta)**2 / (2 * sin(8 deg)**2))`` truncated at 15 degrees. 8
+# degrees is the vertex spacing, so a fiber population scattered over adjacent
+# vertices by the neighbors forms a single maximum.
+_FIXEL_KERNEL_WIDTH = np.deg2rad(8.0)
+_FIXEL_KERNEL_CUTOFF = np.deg2rad(15.0)
+# Local maxima ranked by density that become candidate fixels.
+_FIXEL_MAX_CANDIDATES = 10
+
+
+@lru_cache(maxsize=1)
+def _fixel_sphere_tables():
+    """Axial smoothing kernel and vertex neighbors of ``default_sphere``.
+
+    Returns
+    -------
+    kernel : ndarray (V, V)
+        Symmetric float32 smoothing kernel.
+    neighbors : ndarray (V, M)
+        Axial neighbors of each vertex, padded with the vertex itself.
+    """
+    from dipy.sims.force import default_sphere
+
+    vertices = default_sphere.vertices
+    sin2 = 1.0 - (vertices @ vertices.T) ** 2
+    kernel = np.exp(-sin2 / (2 * np.sin(_FIXEL_KERNEL_WIDTH) ** 2))
+    kernel[sin2 > np.sin(_FIXEL_KERNEL_CUTOFF) ** 2] = 0
+
+    # HemiSphere edges already connect vertices across the equator.
+    n_vert = len(vertices)
+    adjacency = [[v] for v in range(n_vert)]
+    for a, b in default_sphere.edges:
+        adjacency[a].append(b)
+        adjacency[b].append(a)
+    width = max(len(a) for a in adjacency)
+    neighbors = np.array([a + [a[0]] * (width - len(a)) for a in adjacency])
+    return kernel.astype(np.float32), neighbors[:, 1:]
+
+
+def _posterior_peak_params(
+    neighbors,
+    W,
+    d,
+    *,
+    peak_source="hybrid",
+    odf=None,
+    min_fraction=0.05,
+    lib_idx=None,
+    assign_angle=30.0,
+    npeaks=5,
+):
+    """Posterior per-peak (fixel) directions and metrics.
+
+    Fiber slots are not ordered consistently across the neighbors, so the
+    neighbor fibers are first pooled into fixels: the local maxima of an
+    orientation density on ``default_sphere``. Every neighbor fiber is assigned
+    to its nearest fixel and the fixel parameters are posterior averages over
+    the assigned fibers. Vectorized over voxels.
+
+    Parameters
+    ----------
+    neighbors : ndarray (N, K)
+        Library indices of the neighbors.
+    W : ndarray (N, K)
+        Posterior weights of the neighbors, summing to one per voxel.
+    d : dict
+        Simulation dictionary.
+    peak_source : {"fibers", "odf", "hybrid"}, optional
+        How the fixels are found. ``"fibers"``: local maxima of the posterior
+        fiber fractions summed on the sphere vertex of each neighbor fiber and
+        smoothed with a narrow axial kernel. ``"odf"``: local maxima of the
+        posterior ODF of the dispersed simulated ODFs. ``"hybrid"``: the
+        fibers of the best match ``lib_idx``, so the number and layout of the
+        fixels are those of best-match mode while their parameters are
+        posterior averages over the neighbor fibers assigned to them.
+    odf : ndarray (N, V), optional
+        Posterior ODF if already computed (``"odf"`` source only).
+    min_fraction : float, optional
+        Fixels whose posterior fiber fraction (in units of the white matter,
+        so the fibers of a voxel sum to at most one) is below ``min_fraction``
+        are dropped and their fibers reassigned. ``"odf"`` additionally
+        ignores maxima below ``min_fraction`` of the min-max normalized
+        posterior ODF.
+    assign_angle : float, optional
+        Fibers farther than this angle (degrees) from every fixel are left
+        out of all fixels.
+    npeaks : int, optional
+        Number of peak slots, matching ``PeaksAndMetrics``.
+
+    Returns
+    -------
+    params : dict of ndarray
+        The keys of :func:`_peak_params`, plus ``peak_support`` (N, npeaks),
+        the posterior mass of the neighbors with a fiber in each fixel, and
+        ``peak_<name>_std`` (N, npeaks), the posterior standard deviation of
+        every ``PEAK_METRICS`` entry but ``fiber_fraction``. Fixels are sorted
+        by decreasing posterior fiber fraction; empty slots have index -1 and
+        zero direction and metrics. Empty if the library predates the per-fiber
+        metadata.
+    """
+    from dipy.sims.force import default_sphere
+
+    if "fiber_indices" not in d or "fiber_d_par" not in d:
+        return {}
+    if peak_source not in ("fibers", "odf", "hybrid"):
+        raise ValueError(f"Unknown peak_source {peak_source!r}.")
+    if peak_source == "hybrid" and lib_idx is None:
+        raise ValueError("peak_source='hybrid' requires lib_idx.")
+    vertices = default_sphere.vertices
+    n_vert = len(vertices)
+    n_vox = neighbors.shape[0]
+    kernel, vertex_neighbors = _fixel_sphere_tables()
+
+    indices = d["fiber_indices"][neighbors].astype(np.intp)
+    present = indices >= 0
+    indices[~present] = 0
+    W = np.asarray(W, dtype=np.float64)
+    # Like the best match, a voxel has fibers only when its white matter
+    # fraction passes the library threshold, i.e. when the neighbors with fibers
+    # hold most of the posterior. Fixel estimates are then conditioned on those
+    # neighbors, so a voxel whose fiber fractions sum to one in every neighbor
+    # also sums to one here.
+    has_fibers = present.any(axis=2)
+    p_fibers = np.sum(W * has_fibers, axis=1, keepdims=True)
+    if peak_source == "hybrid":
+        # The best match decides which fixels exist, as in best-match mode.
+        best_idx = d["fiber_indices"][lib_idx].astype(np.intp)
+        best_frac = d["fraction_array"][lib_idx]
+        best_present = best_idx >= 0
+        gate = best_present.any(axis=1, keepdims=True)
+    else:
+        gate = p_fibers >= 0.5
+    W = np.where(gate & has_fibers, W / np.where(p_fibers > 0, p_fibers, 1), 0)
+    fractions = np.where(present, d["fraction_array"][neighbors], 0)
+    mass = W[..., None] * fractions  # (N, K, 3) posterior fiber mass
+    units = vertices[indices].astype(np.float32)  # (N, K, 3, 3)
+    flat_units = units.reshape(n_vox, -1, 3)
+    cos_min = np.cos(np.deg2rad(assign_angle))
+
+    def _assign(dirs, valid):
+        """Index of the nearest valid fixel of each fiber, -1 if none."""
+        cos = np.abs(flat_units @ dirs.astype(np.float32).transpose(0, 2, 1))
+        cos = np.where(valid[:, None, :], cos, -1).reshape(*present.shape, -1)
+        nearest = np.argmax(cos, axis=-1)
+        best = np.take_along_axis(cos, nearest[..., None], axis=-1)[..., 0]
+        return np.where(present & (best >= cos_min), nearest, -1)
+
+    def _fixel_mass(assigned, n_fixels):
+        return np.stack(
+            [np.sum(mass * (assigned == p), axis=(1, 2)) for p in range(n_fixels)],
+            axis=1,
+        )
+
+    if peak_source == "hybrid":
+        order = np.argsort(
+            np.where(best_present, -best_frac, np.inf), axis=1, kind="stable"
+        )
+        fixel_valid = np.take_along_axis(best_present, order, axis=1)
+        fixel_dirs = vertices[np.take_along_axis(np.maximum(best_idx, 0), order, 1)]
+    else:
+        # Orientation density and its local maxima over the axial adjacency.
+        if peak_source == "fibers":
+            bins = np.arange(n_vox)[:, None, None] * n_vert + indices
+            density = np.bincount(
+                bins[present], weights=mass[present], minlength=n_vox * n_vert
+            ).reshape(n_vox, n_vert)
+            density = density.astype(np.float32) @ kernel
+            is_max = density > 0
+        else:
+            if odf is None:
+                if "odfs" not in d:
+                    raise ValueError("peak_source='odf' requires a library with ODFs.")
+                odf = posterior_odf(d["odfs"], W, neighbors, n_vert)
+            low = odf.min(axis=1, keepdims=True)
+            density = (odf - low) / (odf.max(axis=1, keepdims=True) - low + EPSILON)
+            is_max = (density > 0) & (density >= min_fraction)
+        vertex_ids = np.arange(n_vert)
+        for col in vertex_neighbors.T:
+            # Strict comparison against lower-index neighbors breaks plateaus.
+            other = density[:, col]
+            is_max &= np.where(col < vertex_ids, density > other, density >= other)
+
+        n_cand = min(_FIXEL_MAX_CANDIDATES, n_vert)
+        score = np.where(is_max, density, -1)
+        cand = np.argpartition(-score, n_cand - 1, axis=1)[:, :n_cand]
+        cand_valid = np.take_along_axis(is_max, cand, axis=1)
+
+        # First pass: drop the candidates with too little fiber mass, then keep
+        # the ``npeaks`` heaviest; their fibers move to the remaining fixels.
+        # Fiber fractions are relative to the white matter, so the posterior
+        # fiber mass of a voxel is at most one.
+        cand_mass = _fixel_mass(_assign(vertices[cand], cand_valid), n_cand)
+        keep = cand_valid & (cand_mass > 0) & (cand_mass >= min_fraction)
+        order = np.argsort(np.where(keep, -cand_mass, np.inf), axis=1, kind="stable")
+        order = order[:, :npeaks]
+        fixel_valid = np.take_along_axis(keep, order, axis=1)
+        fixel_dirs = vertices[np.take_along_axis(cand, order, axis=1)]
+    n_fix = fixel_valid.shape[1]
+    assigned = _assign(fixel_dirs, fixel_valid)
+
+    # Per-fiber values: every fiber has its own diffusivities and dispersion.
+    intra = d["f_ins"][neighbors].astype(np.float64)
+    values = {
+        "neurite_density": intra,
+        "axonal_diffusivity": d["fiber_d_par"][neighbors].astype(np.float64),
+        "extra_axonal_diffusivity": d["fiber_d_perp_extra"][neighbors].astype(
+            np.float64
+        ),
+        "odi": d["fiber_disp"][neighbors].astype(np.float64),
+    }
+    density_per_fiber = d["wm_fraction"][neighbors, None] * fractions * intra
+
+    out = {
+        name: np.zeros((n_vox, npeaks))
+        for name in ("fiber_fraction", "support", "fiber_density", "fiber_density_std")
+    }
+    for name in values:
+        out[name] = np.zeros((n_vox, npeaks))
+        out[f"{name}_std"] = np.zeros((n_vox, npeaks))
+    dirs = np.zeros((n_vox, npeaks, 3))
+    for p in range(n_fix):
+        member = assigned == p
+        w = mass * member
+        f_p = w.sum(axis=(1, 2))
+        safe = np.where(f_p > 0, f_p, 1)
+        out["fiber_fraction"][:, p] = f_p
+        out["support"][:, p] = np.sum(W * member.any(axis=2), axis=1)
+        for name, x in values.items():
+            mean = np.sum(w * x, axis=(1, 2)) / safe
+            var = np.sum(w * (x - mean[:, None, None]) ** 2, axis=(1, 2)) / safe
+            out[name][:, p] = mean
+            out[f"{name}_std"][:, p] = np.sqrt(np.maximum(var, 0))
+        # Fiber density is a sum per neighbor, so its std is over neighbors.
+        per_neighbor = np.sum(density_per_fiber * member, axis=2)
+        fd = np.sum(W * per_neighbor, axis=1)
+        out["fiber_density"][:, p] = fd
+        out["fiber_density_std"][:, p] = np.sqrt(
+            np.maximum(np.sum(W * (per_neighbor - fd[:, None]) ** 2, axis=1), 0)
+        )
+        # Axial mean direction: principal axis of the weighted scatter matrix.
+        weighted = w.reshape(n_vox, -1, 1) * flat_units
+        scatter = weighted.transpose(0, 2, 1) @ flat_units
+        dirs[:, p] = np.linalg.eigh(scatter)[1][..., -1]
+
+    if peak_source == "hybrid":
+        # Neighbors with a different number of fibers spread their fractions
+        # over the fixels, which biases the pooled fractions; the fixels are the
+        # best match's fibers, so they keep its fractions. Fiber density, a sum
+        # of fractions, is rescaled so the fixels again cover the white matter.
+        pooled = out["fiber_fraction"].sum(axis=1, keepdims=True)
+        scale = np.where(pooled > 0, 1 / np.where(pooled > 0, pooled, 1), 0)
+        out["fiber_density"] *= scale
+        out["fiber_density_std"] *= scale
+        best_sorted = np.take_along_axis(best_frac, order, axis=1)
+        out["fiber_fraction"][:, :n_fix] = np.where(
+            fixel_valid & (out["fiber_fraction"][:, :n_fix] > 0), best_sorted, 0
+        )
+
+    # Reassignment can change the fixel masses, so sort once more.
+    filled = out["fiber_fraction"] > 0
+    order = np.argsort(np.where(filled, -out["fiber_fraction"], np.inf), axis=1)
+    filled = np.take_along_axis(filled, order, axis=1)
+    dirs = np.take_along_axis(dirs, order[..., None], axis=1)
+    peak_indices = np.argmax(np.abs(dirs @ vertices.T), axis=-1)
+    # Orient each direction like its sphere vertex, as the best-match peaks.
+    sign = np.sign(np.sum(dirs * vertices[peak_indices], axis=-1, keepdims=True))
+    dirs = np.where(filled[..., None], dirs * np.where(sign == 0, 1, sign), 0)
+    params = {
+        "peak_indices": np.where(filled, peak_indices, -1).astype(np.int32),
+        "peak_dirs": dirs.astype(np.float32),
+    }
+    for name, arr in out.items():
+        arr = np.where(filled, np.take_along_axis(arr, order, axis=1), 0)
+        params[f"peak_{name}"] = arr.astype(np.float32)
+    return params
+
+
 class FORCEModel(ReconstModel):
     """FORCE reconstruction model for signal matching based microstructure."""
 
@@ -754,9 +1119,12 @@ class FORCEModel(ReconstModel):
         simulations=None,
         penalty=1e-5,
         n_neighbors=50,
-        use_posterior=False,
+        use_posterior=True,
         posterior_beta=2000.0,
         compute_odf=False,
+        peak_source="hybrid",
+        peak_min_fraction=0.05,
+        peak_assign_angle=30.0,
         verbose=False,
     ):
         r"""
@@ -781,11 +1149,46 @@ class FORCEModel(ReconstModel):
         n_neighbors : int, optional
             Number of neighbors for matching.
         use_posterior : bool, optional
-            Use posterior averaging instead of best match.
+            Estimate the scalar parameters as the posterior mean over the
+            ``n_neighbors`` matches (default) instead of taking them from the
+            single best match. The fiber configuration (``labels``, ``fracs``)
+            always comes from the best match; the per-peak parameters follow
+            ``peak_source``.
         posterior_beta : float, optional
             Softmax temperature for posterior.
         compute_odf : bool, optional
             Compute posterior ODF maps.
+        peak_source : {"hybrid", "fibers", "odf", "best_match"}, optional
+            Source of the per-peak (fixel) parameters in posterior mode; with
+            ``use_posterior=False`` they always come from the best match.
+            Neighbor fiber slots are not ordered consistently, so the other
+            sources pool the fibers of all neighbors into fixels and assign
+            each neighbor fiber to its nearest fixel. ``"hybrid"`` (default)
+            uses the fibers of the best match as fixels, so the number of
+            fixels, their fiber fractions and their order are those of the
+            best match, while each fixel's direction (fraction-weighted axial
+            mean) and its other metrics (posterior means weighted by fiber
+            fraction) pool the assigned neighbor fibers. ``"fibers"`` finds the
+            fixels as local maxima of the posterior fiber fractions summed on
+            the sphere vertex of each neighbor fiber and smoothed with a narrow
+            axial kernel; ``"odf"`` as local maxima of the posterior ODF. Both
+            use posterior sums for fiber fraction and fiber density and keep
+            up to 5 fixels. On held-out simulations ``"hybrid"`` keeps the
+            best match's fixel count accuracy while lowering the direction and
+            per-fiber metric errors; ``"fibers"`` and ``"odf"`` detect fewer
+            correct fiber counts. ``"best_match"`` takes the fibers of the
+            single best match.
+        peak_min_fraction : float, optional
+            Fixel detection threshold of ``"fibers"`` and ``"odf"``. Fixels
+            with a posterior fiber fraction below ``peak_min_fraction`` are
+            dropped and their fibers reassigned; fiber fractions are relative
+            to the white matter, so the fixels of a voxel sum to at most one.
+            ``"odf"`` additionally ignores maxima below ``peak_min_fraction``
+            of the min-max normalized posterior ODF. Unused by ``"hybrid"`` and
+            ``"best_match"``, whose fixels are the best match's fibers.
+        peak_assign_angle : float, optional
+            Neighbor fibers farther than this angle (degrees) from every fixel
+            are left out of all fixels.
         verbose : bool, optional
             Show progress bar and status messages.
 
@@ -807,6 +1210,13 @@ class FORCEModel(ReconstModel):
         self.use_posterior = use_posterior
         self.posterior_beta = posterior_beta
         self.compute_odf = compute_odf
+        if peak_source not in PEAK_SOURCES:
+            raise ValueError(
+                f"peak_source must be one of {PEAK_SOURCES}; got {peak_source!r}."
+            )
+        self.peak_source = peak_source
+        self.peak_min_fraction = peak_min_fraction
+        self.peak_assign_angle = peak_assign_angle
         self.verbose = verbose
 
         self._index = None
@@ -976,21 +1386,17 @@ class FORCEModel(ReconstModel):
         if output_path is not None:
             save_force_simulations(self.simulations, output_path)
         else:
-            # Save into the .dipy cache and register.
-            # filename is generated inside the lock to avoid races between
-            # concurrent processes reading the same registry length.
+            # Save into the .dipy cache and register. The name must be unique
+            # per generator: concurrent processes read the same registry length
+            # before either registers, so a length-based name made them write
+            # the same file and register several gradient tables for it. The
+            # file is written under a temporary name and renamed, so a reader
+            # never sees a partial library.
             cache_dir = _get_force_cache_dir()
-            filename_holder = {}
-
-            def _append_and_name(registry):
-                idx = len(registry)
-                fname = f"force_sim_{idx}.npz"
-                filename_holder["filename"] = fname
-                return registry  # entry added by _register_cached_simulation
-
-            _locked_registry_update(cache_dir, _append_and_name)
-            filename = filename_holder["filename"]
-            save_force_simulations(self.simulations, str(cache_dir / filename))
+            filename = f"force_sim_{os.getpid()}_{os.urandom(6).hex()}.npz"
+            tmp = cache_dir / f".{filename}.part.npz"
+            save_force_simulations(self.simulations, str(tmp))
+            os.replace(tmp, cache_dir / filename)
             _register_cached_simulation(
                 cache_dir,
                 self.gtab,
@@ -1090,10 +1496,20 @@ class FORCEModel(ReconstModel):
             params["kfa"] = d["kfa"][lib_idx].astype(np.float32)
         params["odf"] = d["odfs"][lib_idx].astype(np.float32) if "odfs" in d else None
         params["predicted_signal"] = d["signals"][lib_idx].astype(np.float32)
+        params.update(_peak_params(lib_idx, d))
         return params
 
     @staticmethod
-    def _posterior_params_batched(neighbors, W, d, lib_idx):
+    def _posterior_params_batched(
+        neighbors,
+        W,
+        d,
+        lib_idx,
+        *,
+        peak_source="hybrid",
+        peak_min_fraction=0.05,
+        peak_assign_angle=30.0,
+    ):
         """Vectorised posterior-averaging over neighbours.
 
         Parameters
@@ -1106,6 +1522,13 @@ class FORCEModel(ReconstModel):
             Simulation dictionary.
         lib_idx : int
             Index of the exact match in the simulation
+        peak_source : {"hybrid", "fibers", "odf", "best_match"}, optional
+            Source of the per-peak parameters, see :class:`FORCEModel`.
+        peak_min_fraction : float, optional
+            Fixel detection threshold, see :class:`FORCEModel`.
+        peak_assign_angle : float, optional
+            Fiber-to-fixel assignment angle in degrees, see
+            :class:`FORCEModel`.
 
         Returns
         -------
@@ -1139,19 +1562,27 @@ class FORCEModel(ReconstModel):
 
         # Posterior ODF
         if "odfs" in d:
-            K = neighbors.shape[1]
-            odf = np.zeros((neighbors.shape[0], d["odfs"].shape[1]), dtype=np.float32)
-            for kk in range(K):
-                odf_k = d["odfs"][neighbors[:, kk]].astype(np.float32)
-                odf_k /= np.max(odf_k, axis=1, keepdims=True) + EPSILON
-                odf += W[:, kk : kk + 1] * odf_k
-            odf /= np.max(odf, axis=1, keepdims=True) + EPSILON
-            params["odf"] = odf
+            params["odf"] = posterior_odf(d["odfs"], W, neighbors, d["odfs"].shape[1])
         else:
             params["odf"] = None
 
         # Posterior mean signal
         params["predicted_signal"] = posterior_mean_signal(d["signals"], W, neighbors)
+        if peak_source == "best_match":
+            params.update(_peak_params(lib_idx, d))
+        else:
+            params.update(
+                _posterior_peak_params(
+                    neighbors,
+                    W,
+                    d,
+                    peak_source=peak_source,
+                    odf=params["odf"],
+                    min_fraction=peak_min_fraction,
+                    assign_angle=peak_assign_angle,
+                    lib_idx=lib_idx,
+                )
+            )
         return params
 
     @multi_voxel_fit(
@@ -1235,7 +1666,15 @@ class FORCEModel(ReconstModel):
         if self.use_posterior:
             entropy = -np.sum(W * np.log(W + EPSILON), axis=1)
 
-            params_arrays = self._posterior_params_batched(neighbors, W, d, lib_idx)
+            params_arrays = self._posterior_params_batched(
+                neighbors,
+                W,
+                d,
+                lib_idx,
+                peak_source=self.peak_source,
+                peak_min_fraction=self.peak_min_fraction,
+                peak_assign_angle=self.peak_assign_angle,
+            )
             params_arrays["uncertainty"] = U
             params_arrays["ambiguity"] = A
             params_arrays["entropy"] = entropy.astype(np.float32)
@@ -1423,6 +1862,128 @@ class FORCEFit(ReconstFit):
     def fracs(self):
         """Fiber fractions."""
         return self._params.get("fracs", None)
+
+    @property
+    def peak_dirs(self):
+        """Per-peak (fixel) directions, shape (..., 5, 3).
+
+        In posterior mode these are the posterior fixels pooled from the fibers
+        of all neighbors (see ``peak_source`` in :class:`FORCEModel`), else the
+        fibers of the best match. Peaks are sorted by decreasing fiber fraction
+        and every ``peak_*`` metric uses the same slot order. Empty slots are
+        zero. None if the simulation library has no per-fiber metadata.
+        """
+        return self._params.get("peak_dirs", None)
+
+    @property
+    def peak_indices(self):
+        """Simulation sphere index of each peak, shape (..., 5); -1 if empty.
+
+        For posterior fixels, the sphere vertex nearest to ``peak_dirs``.
+        """
+        return self._params.get("peak_indices", None)
+
+    @property
+    def peak_fiber_fraction(self):
+        """Fraction of the white matter occupied by each fiber, shape (..., 5).
+
+        For posterior fixels, the posterior sum of the fractions of the
+        neighbor fibers assigned to the fixel.
+        """
+        return self._params.get("peak_fiber_fraction", None)
+
+    @property
+    def peak_support(self):
+        """Posterior support of each fixel, shape (..., 5).
+
+        Total posterior weight of the neighbors with at least one fiber
+        assigned to the fixel, in [0, 1]. Only for posterior fixels
+        (``use_posterior=True`` and ``peak_source`` other than
+        ``"best_match"``); None otherwise.
+        """
+        return self._params.get("peak_support", None)
+
+    @property
+    def peak_fiber_density(self):
+        """Intra-axonal volume fraction of the voxel per fiber, shape (..., 5).
+
+        ``wm_fraction * fiber_fraction * neurite_density``, the FORCE analogue
+        of the apparent fiber density of each FOD lobe.
+        """
+        return self._params.get("peak_fiber_density", None)
+
+    @property
+    def peak_fiber_density_std(self):
+        """Posterior standard deviation of ``peak_fiber_density``.
+
+        Spread over the neighbors of the fixel fiber density each neighbor
+        contributes. Like every ``peak_<name>_std`` map, shape (..., 5) and
+        only for posterior fixels; None otherwise.
+        """
+        return self._params.get("peak_fiber_density_std", None)
+
+    @property
+    def peak_neurite_density(self):
+        """Intra-axonal fraction (axonal packing) of each fiber, shape (..., 5)."""
+        return self._params.get("peak_neurite_density", None)
+
+    @property
+    def peak_neurite_density_std(self):
+        """Posterior standard deviation of ``peak_neurite_density``.
+
+        Weighted by the posterior fiber fraction of the assigned fibers.
+        """
+        return self._params.get("peak_neurite_density_std", None)
+
+    @property
+    def peak_axonal_diffusivity(self):
+        """Axonal diffusivity of each fiber in mm^2/s, shape (..., 5).
+
+        Diffusivity along the intra-axonal sticks, which equals the intra-axonal
+        and the extra-axonal parallel diffusivity. Every simulation shares it
+        among its fibers.
+        """
+        return self._params.get("peak_axonal_diffusivity", None)
+
+    @property
+    def peak_axonal_diffusivity_std(self):
+        """Posterior standard deviation of ``peak_axonal_diffusivity``.
+
+        Weighted by the posterior fiber fraction of the assigned fibers.
+        """
+        return self._params.get("peak_axonal_diffusivity_std", None)
+
+    @property
+    def peak_extra_axonal_diffusivity(self):
+        """Extra-axonal perpendicular diffusivity in mm^2/s, shape (..., 5).
+
+        Every simulation shares it among its fibers.
+        """
+        return self._params.get("peak_extra_axonal_diffusivity", None)
+
+    @property
+    def peak_extra_axonal_diffusivity_std(self):
+        """Posterior standard deviation of ``peak_extra_axonal_diffusivity``.
+
+        Weighted by the posterior fiber fraction of the assigned fibers.
+        """
+        return self._params.get("peak_extra_axonal_diffusivity_std", None)
+
+    @property
+    def peak_odi(self):
+        """Orientation dispersion index of each fiber, shape (..., 5).
+
+        Every simulation shares it among its fibers.
+        """
+        return self._params.get("peak_odi", None)
+
+    @property
+    def peak_odi_std(self):
+        """Posterior standard deviation of ``peak_odi``.
+
+        Weighted by the posterior fiber fraction of the assigned fibers.
+        """
+        return self._params.get("peak_odi_std", None)
 
     @property
     def uncertainty_fa(self):
@@ -1660,18 +2221,31 @@ def force_peaks(fitted_object, *, mask=None, sh_order=8):
     Notes
     -----
     Multi-voxel conversion uses 10,000-voxel blocks to bound temporary memory.
+
+    The peaks are the fit's ``peak_dirs`` (posterior fixels by default, see
+    ``peak_source`` in :class:`FORCEModel`, or the fibers of the best match),
+    sorted by decreasing fiber fraction, and ``peak_values`` holds those
+    fractions. They share their slot order with the ``peak_*`` metrics of the
+    fit, so ``pam.peak_dirs`` and, e.g., ``fit.peak_fiber_density`` describe
+    the same fibers. Libraries generated without per-fiber metadata only
+    provide the peak directions, in sphere-index order.
     """
     from dipy.sims.force import default_sphere
 
     if not isinstance(fitted_object, MultiVoxelFit):
         # Single Voxel Case
-        labels = fitted_object.label
-        fracs = fitted_object.fracs
         odf = fitted_object.odf
-        p_out, p_ind, p_val = postprocess_peaks(
-            labels[None, :], default_sphere, fracs[None, :]
-        )
-        res_dirs, res_inds, res_vals = p_out[0], p_ind[0], p_val[0]
+        if fitted_object.peak_indices is not None:
+            res_dirs = fitted_object.peak_dirs
+            res_inds = fitted_object.peak_indices
+            res_vals = fitted_object.peak_fiber_fraction
+        else:
+            p_out, p_ind, p_val = postprocess_peaks(
+                fitted_object.label[None, :],
+                default_sphere,
+                fitted_object.fracs[None, :],
+            )
+            res_dirs, res_inds, res_vals = p_out[0], p_ind[0], p_val[0]
         res_sh = (
             sf_to_sh(odf, default_sphere, sh_order_max=sh_order)
             if odf is not None
@@ -1687,20 +2261,28 @@ def force_peaks(fitted_object, *, mask=None, sh_order=8):
         res_inds = np.full((fits.size, 5), -1, dtype=np.int32)
         res_vals = np.zeros((fits.size, 5), dtype=np.float32)
         res_sh = invB = None
+        fitted = np.flatnonzero(fit_mask)
+        has_peaks = fitted.size > 0 and fits[fitted[0]].peak_indices is not None
 
         for start in range(0, fits.size, 10_000):
             chunk = slice(start, start + 10_000)
             if not fit_mask[chunk].any():
                 continue
             block = MultiVoxelFit(fitted_object.model, fits[chunk], fit_mask[chunk])
-            labels, fracs = block.label, block.fracs
+            keep = np.ones(block.shape, dtype=bool)
             output = chunk
             if peak_mask is not None:
-                labels, fracs = labels[peak_mask[chunk]], fracs[peak_mask[chunk]]
-                output = start + np.flatnonzero(peak_mask[chunk])
-            p_out, p_ind, p_val = postprocess_peaks(labels, default_sphere, fracs)
+                keep = peak_mask[chunk]
+                output = start + np.flatnonzero(keep)
+            if has_peaks:
+                p_out = block.peak_dirs[keep]
+                p_ind = np.where(fit_mask[chunk, None], block.peak_indices, -1)[keep]
+                p_val = block.peak_fiber_fraction[keep]
+            else:
+                p_out, p_ind, p_val = postprocess_peaks(
+                    block.label[keep], default_sphere, block.fracs[keep]
+                )
             res_dirs[output], res_inds[output], res_vals[output] = p_out, p_ind, p_val
-
             odf = block.odf
             if np.issubdtype(odf.dtype, np.floating):
                 if invB is None:
@@ -1712,7 +2294,7 @@ def force_peaks(fitted_object, *, mask=None, sh_order=8):
                     v_max > 1.0, (odf - v_min) / (v_max - v_min + 1e-12), odf
                 )
                 res_sh[chunk] = np.dot(odf, invB)
-            del block, labels, fracs, odf, p_out, p_ind, p_val
+            del block, odf, p_out, p_ind, p_val
 
         res_dirs = res_dirs.reshape((*original_shape, 5, 3))
         res_inds = res_inds.reshape((*original_shape, 5))

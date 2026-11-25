@@ -117,7 +117,10 @@ class Skyline:
         directionally colored streamlines, ``"random"`` for the next color
         from a distinguishable colormap per tractogram, an RGB(A) tuple in
         ``[0, 1]``, or a string of three space-separated numbers parsed to
-        such a tuple. If None, ``"direction"`` is used.
+        such a tuple. If None, each tractogram storing per-point colors in
+        ``data_per_point["color"]`` (scilpy / MI-Brain convention, values in
+        ``[0, 255]``) is rendered with them, and ``"direction"`` is used
+        otherwise. An explicit value always overrides stored colors.
     cluster_thr : float, optional
         Final distance threshold, in mm, used by ``qbx_and_merge`` when
         clustering is enabled; small-animal data may need a smaller value
@@ -256,7 +259,10 @@ class Skyline:
             directionally colored streamlines, ``"random"`` for the next color
             from a distinguishable colormap per tractogram, an RGB(A) tuple in
             ``[0, 1]``, or a string of three space-separated numbers parsed to
-            such a tuple. If None, ``"direction"`` is used.
+            such a tuple. If None, each tractogram storing per-point colors in
+            ``data_per_point["color"]`` (scilpy / MI-Brain convention, values
+            in ``[0, 255]``) is rendered with them, and ``"direction"`` is
+            used otherwise. An explicit value always overrides stored colors.
         cluster_thr : float, optional
             Final distance threshold, in mm, used by ``qbx_and_merge`` when
             clustering is enabled; small-animal data may need a smaller value
@@ -348,9 +354,7 @@ class Skyline:
             self._bg_color = bg_color
             self.window.screens[0].scene.background = self._bg_color
 
-            if tract_colors is None:
-                tract_colors = "direction"
-            elif isinstance(tract_colors, str) and len(tract_colors.split(" ")) == 3:
+            if isinstance(tract_colors, str) and len(tract_colors.split(" ")) == 3:
                 tract_colors = tuple(map(float, tract_colors.split(" ")))
             self._tract_colors = tract_colors
 
@@ -1579,7 +1583,10 @@ def skyline_from_files(
         directionally colored streamlines, ``"random"`` for the next color
         from a distinguishable colormap per tractogram, an RGB(A) tuple in
         ``[0, 1]``, or a string of three space-separated numbers parsed to
-        such a tuple. If None, ``"direction"`` is used.
+        such a tuple. If None, each tractogram storing per-point colors in
+        ``data_per_point["color"]`` (scilpy / MI-Brain convention, values in
+        ``[0, 255]``) is rendered with them, and ``"direction"`` is used
+        otherwise. An explicit value always overrides stored colors.
     cluster_thr : float, optional
         Final distance threshold, in mm, used by ``qbx_and_merge`` when
         clustering is enabled; small-animal data may need a smaller value
@@ -1737,7 +1744,10 @@ def skyline(
         directionally colored streamlines, ``"random"`` for the next color
         from a distinguishable colormap per tractogram, an RGB(A) tuple in
         ``[0, 1]``, or a string of three space-separated numbers parsed to
-        such a tuple. If None, ``"direction"`` is used.
+        such a tuple. If None, each tractogram storing per-point colors in
+        ``data_per_point["color"]`` (scilpy / MI-Brain convention, values in
+        ``[0, 255]``) is rendered with them, and ``"direction"`` is used
+        otherwise. An explicit value always overrides stored colors.
     cluster_thr : float, optional
         Final distance threshold, in mm, used by ``qbx_and_merge`` when
         clustering is enabled; small-animal data may need a smaller value

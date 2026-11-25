@@ -1,4 +1,6 @@
+from contextlib import nullcontext
 import copy
+import functools
 from warnings import warn
 
 import numpy as np
@@ -7,6 +9,32 @@ from scipy.linalg.lapack import dgesvd as real_svd, zgesvd as complex_svd
 
 from dipy.denoise.pca_noise_estimate import pca_noise_estimate
 from dipy.utils.deprecator import warning_for_keywords
+from dipy.utils.optpkg import optional_package
+
+threadpoolctl, has_threadpoolctl, _ = optional_package("threadpoolctl")
+
+
+def _single_threaded_blas(func):
+    """Run ``func`` with BLAS/LAPACK limited to one thread.
+
+    Each patch is decomposed with a small (n_volumes x n_volumes) LAPACK
+    call, for which threading costs more than it gains; with several
+    threads per call, concurrent denoising processes also oversubscribe the
+    cores. Limiting the thread pools only for this call leaves the caller's
+    settings unchanged.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        ctx = (
+            threadpoolctl.threadpool_limits(limits=1, user_api="blas")
+            if has_threadpoolctl
+            else nullcontext()
+        )
+        with ctx:
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def dimensionality_problem_message(arr, num_samples, spr):
@@ -177,6 +205,7 @@ def compute_suggested_patch_radius(arr, patch_size):
     return int((root - 1) / 2)
 
 
+@_single_threaded_blas
 @warning_for_keywords()
 def genpca(
     arr,

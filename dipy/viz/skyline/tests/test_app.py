@@ -302,8 +302,57 @@ def test_explicit_background_color_wins_over_glass_brain(make_skyline):
     assert viewer._bg_color == (0.2, 0.4, 0.6)
 
 
-def test_tract_colors_default_to_direction(image_skyline):
-    assert image_skyline._tract_colors == "direction"
+def _colored_tractogram_input(name="colored.trx"):
+    sft = _sft()
+    n_points = len(sft.streamlines.get_data())
+    colors = np.zeros((n_points, 3), dtype=np.float32)
+    colors[:, 0] = np.linspace(0, 255, n_points)
+    colors[:, 2] = 255
+    sft.data_per_point = {
+        "color": np.split(colors, np.cumsum([len(s) for s in sft.streamlines])[:-1])
+    }
+    return (sft, name), colors / 255
+
+
+def test_default_tract_colors_render_stored_point_colors(tmp_path, make_skyline):
+    colored, expected = _colored_tractogram_input()
+
+    viewer = make_skyline(
+        tractograms=[colored, _tractogram_input()], out_stealth_png="colored.png"
+    )
+
+    colored_viz, plain_viz = viewer._tractogram_visualizations
+    npt.assert_allclose(colored_viz.color, expected, rtol=1e-6)
+    assert plain_viz.color == "direction"
+    with Image.open(tmp_path / "colored.png") as image:
+        pixels = np.asarray(image.convert("RGB"))
+    assert np.any(pixels != pixels[0, 0])
+
+
+def test_explicit_tract_colors_override_stored_point_colors(make_skyline):
+    colored, _ = _colored_tractogram_input()
+
+    viewer = make_skyline(tractograms=[colored], tract_colors="direction")
+
+    assert viewer._tractogram_visualizations[0].color == "direction"
+
+
+@pytest.mark.parametrize("extension", [".trk", ".trx"])
+def test_skyline_from_files_keeps_stored_point_colors(tmp_path, extension):
+    (sft, _), expected = _colored_tractogram_input()
+    tract_path = tmp_path / f"colored{extension}"
+    save_tractogram(sft, str(tract_path), bbox_valid_check=False)
+
+    viewer = skyline_from_files(
+        [str(tract_path)],
+        stealth=True,
+        out_dir=str(tmp_path),
+        out_stealth_png="from_files.png",
+    )
+
+    npt.assert_allclose(
+        viewer._tractogram_visualizations[0].color, expected, rtol=1e-5, atol=1e-6
+    )
 
 
 def test_tract_colors_string_triplet_is_parsed_into_floats(make_skyline):

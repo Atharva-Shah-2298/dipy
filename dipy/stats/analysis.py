@@ -11,6 +11,7 @@ from dipy.segment.clustering import QuickBundles
 from dipy.segment.metricspeed import AveragePointwiseEuclideanMetric
 from dipy.tracking.streamline import (
     Streamlines,
+    fixel_values_from_volume,
     length,
     orient_by_streamline,
     set_number_of_points,
@@ -60,18 +61,45 @@ def peak_values(bundle, peaks, dt, pname, bname, subject, group_id, ind, dir_nam
     )
 
 
+def _check_metric_shape(metric, peak_dirs):
+    """Validate a scalar (3D) or per-peak (4D + directions) metric."""
+    if peak_dirs is None:
+        if metric.ndim != 3:
+            raise ValueError(
+                "metric must be a 3D scalar volume when peak_dirs is not given; "
+                f"got shape {metric.shape}."
+            )
+    elif metric.ndim != 4 or peak_dirs.shape != metric.shape + (3,):
+        raise ValueError(
+            "A per-peak metric must have shape (X, Y, Z, K) and peak_dirs shape "
+            f"(X, Y, Z, K, 3); got {metric.shape} and {peak_dirs.shape}."
+        )
+
+
 def anatomical_measures(
-    bundle, metric, dt, pname, bname, subject, group_id, ind, dir_name
+    bundle,
+    metric,
+    dt,
+    pname,
+    bname,
+    subject,
+    group_id,
+    ind,
+    dir_name,
+    *,
+    peak_dirs=None,
+    max_angle=45.0,
 ):
     """Calculates dti measure (eg: FA, MD) per point on streamlines and
         save it in hd5 file.
 
     Parameters
     ----------
-    bundle : string
-        Name of bundle being analyzed
-    metric : matrix of float values
-        dti metric e.g. FA, MD
+    bundle : Streamlines
+        Bundle being analyzed, in the voxel coordinates of ``metric``.
+    metric : ndarray
+        3D scalar volume (e.g. FA, MD), or per-peak volume of shape
+        (X, Y, Z, K) when ``peak_dirs`` is given.
     dt : DataFrame
         DataFrame to be populated
     pname : string
@@ -86,24 +114,44 @@ def anatomical_measures(
         ind tells which disk number a point belong.
     dir_name : string
         path of output directory
+    peak_dirs : ndarray, shape (X, Y, Z, K, 3), optional
+        Peak directions (voxel axes) aligned with the last axis of ``metric``.
+        When given, each point takes the value of the peak most parallel to
+        the streamline in its voxel (see
+        :func:`~dipy.tracking.streamline.fixel_values_from_volume`), and points
+        without a matching peak are not stored.
+    max_angle : float, optional
+        Maximum angle in degrees between the streamline tangent and the
+        matched peak. Only used when ``peak_dirs`` is given.
 
     """
-    dt["streamline"] = []
-    dt["disk"] = []
-    dt["subject"] = []
-    dt[pname] = []
-    dt["group"] = []
+    metric = np.asarray(metric)
+    if peak_dirs is not None:
+        peak_dirs = np.asarray(peak_dirs)
+    _check_metric_shape(metric, peak_dirs)
 
-    values = map_coordinates(metric, bundle._data.T, order=1)
+    bundle = _as_streamlines(bundle)
+    if peak_dirs is None:
+        values = map_coordinates(metric, bundle._data.T, order=1)
+    else:
+        values = np.concatenate(
+            fixel_values_from_volume(
+                metric, peak_dirs, bundle, np.eye(4), max_angle=max_angle
+            )
+        )
+    disks = np.asarray(ind)[: len(values)] + 1
+    streamline_ids = np.repeat(np.arange(len(bundle)), bundle._lengths)
+    if peak_dirs is not None:
+        matched = np.isfinite(values)
+        values = values[matched]
+        disks = disks[matched]
+        streamline_ids = streamline_ids[matched]
 
-    dt["disk"].extend(ind[list(range(len(values)))] + 1)
-    dt["subject"].extend([subject] * len(values))
-    dt["group"].extend([group_id] * len(values))
-    dt[pname].extend(values)
-
-    for st_i in range(len(bundle)):
-        st = bundle[st_i]
-        dt["streamline"].extend([st_i] * len(st))
+    dt["streamline"] = list(streamline_ids)
+    dt["disk"] = list(disks)
+    dt["subject"] = [subject] * len(values)
+    dt[pname] = list(values)
+    dt["group"] = [group_id] * len(values)
 
     file_name = f"{bname}_{pname}"
 
@@ -155,7 +203,17 @@ def assignment_map(target_bundle, model_bundle, no_disks):
     return dist, indx
 
 
-def buan_profile(model_bundle, bundle, orig_bundle, metric, affine, *, no_disks=100):
+def buan_profile(
+    model_bundle,
+    bundle,
+    orig_bundle,
+    metric,
+    affine,
+    *,
+    no_disks=100,
+    peak_dirs=None,
+    max_angle=45.0,
+):
     """
     Create BUAN weighted mean bundle profiles (lite).
 
@@ -175,7 +233,9 @@ def buan_profile(model_bundle, bundle, orig_bundle, metric, affine, *, no_disks=
         sampling the metric volume. Must correspond point-for-point to
         ``bundle``.
     metric : ndarray
-        3-D scalar volume (e.g., FA) in the same voxel space as ``affine``.
+        3-D scalar volume (e.g., FA) in the same voxel space as ``affine``,
+        or per-peak (fixel) volume of shape (X, Y, Z, K) when ``peak_dirs``
+        is given.
     affine : ndarray
         Voxel-to-world affine of the metric volume (as returned by
         ``nib.load(...).affine``). Used to convert ``orig_bundle`` from
@@ -183,12 +243,29 @@ def buan_profile(model_bundle, bundle, orig_bundle, metric, affine, *, no_disks=
     no_disks : int, optional
         Number of alongtract segments/disks used for dividing bundle into
         segments.
+    peak_dirs : ndarray, shape (X, Y, Z, K, 3), optional
+        Peak directions in voxel axes (the frame of
+        ``PeaksAndMetrics.peak_dirs``), with ``peak_dirs[..., k, :]`` the
+        direction of ``metric[..., k]``. When given, ``metric`` is sampled
+        per peak instead of being interpolated (see Notes).
+    max_angle : float, optional
+        Maximum angle in degrees between the streamline tangent and the
+        matched peak. Only used when ``peak_dirs`` is given.
 
     Returns
     -------
     bundle_profile : ndarray, shape (no_disks,)
         Inverse-distance-weighted mean metric value for each disk segment.
         Disks with no valid data points are set to NaN.
+
+    Notes
+    -----
+    Scalar metrics are trilinearly interpolated at every streamline point.
+    Per-peak metrics use the closest-fixel strategy of
+    :func:`~dipy.tracking.streamline.fixel_values_from_volume`: each point
+    takes the value of the peak most parallel to the streamline tangent in
+    the voxel containing the point. Points with no peak within ``max_angle``
+    get no value and do not contribute to the profile.
 
     References
     ----------
@@ -198,13 +275,24 @@ def buan_profile(model_bundle, bundle, orig_bundle, metric, affine, *, no_disks=
 
     if len(model_bundle) == 0 or len(bundle) == 0 or len(orig_bundle) == 0:
         raise ValueError("One of the bundles contains no streamlines")
+    metric = np.asarray(metric)
+    if peak_dirs is not None:
+        peak_dirs = np.asarray(peak_dirs)
+    _check_metric_shape(metric, peak_dirs)
 
     dist, indx = assignment_map(bundle, model_bundle, no_disks)
     ind = np.array(indx)
-    affine_r = np.linalg.inv(affine)
-    transformed_orig_bundle = transform_streamlines(orig_bundle, affine_r)
     bundle_profile = np.zeros(no_disks)
-    values = map_coordinates(metric, transformed_orig_bundle._data.T, order=1)
+    if peak_dirs is None:
+        affine_r = np.linalg.inv(affine)
+        transformed_orig_bundle = transform_streamlines(orig_bundle, affine_r)
+        values = map_coordinates(metric, transformed_orig_bundle._data.T, order=1)
+    else:
+        values = np.concatenate(
+            fixel_values_from_volume(
+                metric, peak_dirs, orig_bundle, affine, max_angle=max_angle
+            )
+        )
 
     epsilon = 1e-8
     weights = 1 / (dist + epsilon)

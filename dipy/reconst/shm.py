@@ -1049,7 +1049,14 @@ class SphHarmFit(OdfFit):
     def gfa(self):
         return _gfa_sh(self.shm_coeff, sh0_index=0)
 
-    def afd(self, *, npeaks=5, peak_threshold=0.1, integral_threshold=0.0):
+    def afd(
+        self,
+        *,
+        npeaks=5,
+        peak_threshold=0.1,
+        integral_threshold=0.0,
+        return_directions=False,
+    ):
         """Apparent fiber density (AFD) of each FOD lobe.
 
         Each FOD is split into lobes :footcite:p:`Smith2013` and the AFD of a
@@ -1066,12 +1073,20 @@ class SphHarmFit(OdfFit):
         integral_threshold : float, optional
             Lobes whose AFD is below this value are discarded
             (``-fmls_integral`` in MRtrix3).
+        return_directions : bool, optional
+            Also return the direction of each lobe's peak.
 
         Returns
         -------
         afd : ndarray (..., npeaks)
             AFD of each lobe, sorted by descending peak amplitude. Missing
             lobes are set to 0.
+        directions : ndarray (..., npeaks, 3)
+            Unit direction of the largest sampled amplitude of each lobe, in
+            the same slot order as `afd` and in the frame of the sampling
+            sphere (voxel axes, like the ``peak_dirs`` of ``peaks_from_model``).
+            Missing lobes are set to 0. Only returned if `return_directions`
+            is True.
 
         Notes
         -----
@@ -1088,6 +1103,7 @@ class SphHarmFit(OdfFit):
         B = self.model.sampling_matrix(sphere)
         shm_coeff = self.shm_coeff.reshape(-1, self.shm_coeff.shape[-1])
         afd = np.zeros((shm_coeff.shape[0], npeaks))
+        indices = np.full((shm_coeff.shape[0], npeaks), -1, dtype=np.intp)
         valid = np.flatnonzero((shm_coeff[:, 0] > 0) & np.isfinite(shm_coeff[:, 0]))
 
         # Process voxels in chunks to bound the memory of the sampled FODs
@@ -1096,7 +1112,7 @@ class SphHarmFit(OdfFit):
             voxels = valid[start : start + chunk_size]
             odf = np.dot(shm_coeff[voxels], B.T)
             order = np.argsort(-odf, axis=-1, kind="stable")
-            afd[voxels] = fmls_afd(
+            afd[voxels], indices[voxels] = fmls_afd(
                 odf,
                 order,
                 weights,
@@ -1105,8 +1121,15 @@ class SphHarmFit(OdfFit):
                 npeaks,
                 peak_threshold,
                 integral_threshold,
+                return_indices=True,
             )
-        return afd.reshape(self.shape + (npeaks,))
+        afd = afd.reshape(self.shape + (npeaks,))
+        if not return_directions:
+            return afd
+        directions = np.where(
+            indices[..., None] >= 0, sphere.vertices[np.maximum(indices, 0)], 0
+        )
+        return afd, directions.reshape(self.shape + (npeaks, 3))
 
     @property
     def shm_coeff(self):

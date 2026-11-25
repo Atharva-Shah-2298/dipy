@@ -67,13 +67,18 @@ print(f"mask shape: {mask.shape}, brain voxels: {mask.sum()}")
 # * ``penalty`` — fiber-complexity penalty subtracted from the match score,
 #   scaled by the number of fibers. Larger values bias the match towards
 #   simpler configurations.
-# * ``use_posterior`` — when ``True``, parameters are averaged over the
-#   ``n_neighbors`` nearest entries weighted by a softmax posterior; when
-#   ``False`` (default) only the single best-match entry is used.
+# * ``use_posterior`` — when ``True`` (default), parameters are averaged over
+#   the ``n_neighbors`` nearest entries weighted by a softmax posterior; when
+#   ``False`` only the single best-match entry is used.
 # * ``posterior_beta`` — softmax temperature of that posterior. Larger values
 #   concentrate the weights on the closest matches.
 # * ``compute_odf`` — when ``True``, a posterior ODF is assembled per voxel and
 #   exposed as ``fit.odf``.
+# * ``peak_source`` — how the per-peak (fixel) maps are built in posterior
+#   mode: ``"hybrid"`` (default) keeps the fibers of the best match as fixels
+#   and pools the fibers of all neighbors into them, ``"fibers"`` and
+#   ``"odf"`` also find the fixels from the posterior, and ``"best_match"``
+#   keeps the single best match.
 #
 # The posterior over the ``n_neighbors`` matches is always computed, even when
 # ``use_posterior=False``. That flag only decides where the *point estimates*
@@ -153,6 +158,41 @@ peaks = force_peaks(fit)
 # data.
 
 save_pam("force_peaks.pam5", peaks, affine=affine)
+
+###############################################################################
+# FORCE also describes each fiber population (fixel) of the voxel, much like
+# the apparent fiber density of each FOD lobe in CSD. The ``peak_*``
+# attributes are (X, Y, Z, 5) maps aligned with ``peaks.peak_dirs``
+# (X, Y, Z, 5, 3): slot ``k`` describes the fixel whose direction is
+# ``peaks.peak_dirs[..., k, :]``. Peaks are sorted by decreasing fiber
+# fraction and empty slots are zero.
+#
+# In posterior mode (``peak_source="hybrid"``, the default) the fixels are
+# the fibers of the best match, so their number and fiber fractions are those
+# of the best match. Each fiber of the ``n_neighbors`` matches joins the
+# nearest fixel within 30 degrees; the fixel direction is the posterior mean
+# orientation of its fibers and its other metrics are posterior means. With
+# ``use_posterior=False`` (or ``peak_source="best_match"``) they are the fibers
+# of the best match.
+#
+# * ``peak_fiber_fraction`` — share of the white matter occupied by the fixel.
+# * ``peak_fiber_density`` — intra-axonal volume fraction of the voxel that
+#   belongs to the fixel (``wm_fraction * fiber_fraction * neurite_density``).
+# * ``peak_neurite_density`` — intra-axonal fraction (axonal packing) of the
+#   fixel.
+# * ``peak_axonal_diffusivity`` and ``peak_extra_axonal_diffusivity`` — the
+#   diffusivity along the axons and the extra-axonal perpendicular diffusivity.
+# * ``peak_odi`` — orientation dispersion of the fixel.
+#
+# Posterior fixels also come with ``peak_support``, the posterior weight of
+# the matches that contain the fixel, and a posterior standard deviation for
+# each metric, e.g. ``peak_neurite_density_std``. Combined with tractography,
+# :func:`dipy.tracking.streamline.fixel_values_from_volume` samples these maps
+# along streamlines, using at each point the peak closest to the streamline.
+
+for name in ("fiber_fraction", "fiber_density", "neurite_density"):
+    peak_map = getattr(fit, f"peak_{name}")
+    save_nifti(f"force_peak_{name}.nii.gz", peak_map.astype(np.float32), affine)
 
 
 ###############################################################################

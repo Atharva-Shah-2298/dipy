@@ -177,6 +177,36 @@ def create_cluster_help(*, position=(0, 0), size=(200, 180)):
     return text_block
 
 
+def _stored_point_colors(sft):
+    """Return per-point RGB colors stored in a tractogram, if any.
+
+    Colors are read from ``sft.data_per_point["color"]`` following the
+    scilpy / MI-Brain convention. Values are expected in ``[0, 255]``;
+    arrays whose maximum is at most 1 are assumed to already be in
+    ``[0, 1]`` and are kept unchanged.
+
+    Parameters
+    ----------
+    sft : StatefulTractogram
+        Tractogram that may carry ``data_per_point["color"]``.
+
+    Returns
+    -------
+    ndarray, shape (n_points, 3) or None
+        Float32 RGB colors in ``[0, 1]`` for every point of every
+        streamline, in streamline order, or None when the tractogram does not
+        store point colors.
+    """
+    data_per_point = getattr(sft, "data_per_point", None)
+    if not data_per_point or "color" not in data_per_point:
+        return None
+    colors = np.asarray(data_per_point["color"].get_data(), dtype=np.float32)
+    colors = colors.reshape(len(colors), -1)[:, :3]
+    if colors.size and colors.max() > 1:
+        colors = colors / np.float32(255)
+    return colors
+
+
 def create_streamline_visualization(
     input,
     idx,
@@ -184,7 +214,6 @@ def create_streamline_visualization(
     is_cluster=False,
     thr=15.0,
     line_type="Line",
-    color=(1, 0, 0),
     render_callback=None,
     colormap=None,
     tract_colors=None,
@@ -210,8 +239,6 @@ def create_streamline_visualization(
         Clustering distance threshold.
     line_type : str, optional
         The type of line to render ("Line" or "Tube").
-    color : tuple, optional
-        Color of the streamline rendering.
     render_callback : callable, optional
         Callback function to be called after rendering.
     colormap : colormap, optional
@@ -219,7 +246,10 @@ def create_streamline_visualization(
     tract_colors : str or tuple of float or None, optional
         ``"random"`` picks the next color from ``colormap``; ``"direction"``
         or a 3- or 4-value tuple in ``[0, 1]`` is used as-is; any other
-        string raises ``ValueError``. If None, ``color`` is used unchanged.
+        string raises ``ValueError``. If None, per-point colors stored in
+        ``sft.data_per_point["color"]`` are used when present (values in
+        ``[0, 255]``, or in ``[0, 1]`` when their maximum is at most 1),
+        otherwise ``"direction"``. Ignored when ``is_cluster`` is True.
     switch_render_callback : callable, optional
         Callback function to switch rendering type, used for cluster visualization.
     loader : callable, optional
@@ -273,16 +303,19 @@ def create_streamline_visualization(
             async_clustering=async_clustering,
         )
 
-    if tract_colors is not None:
-        if tract_colors == "random":
-            color = next(colormap)
-        elif tract_colors == "direction" or len(tract_colors) in [3, 4]:
-            color = tract_colors
-        else:
-            raise ValueError(
-                "Invalid tract_colors value. Must be 'random', 'direction', "
-                "or a tuple of 3 or 4 values."
-            )
+    if tract_colors is None:
+        color = _stored_point_colors(sft)
+        if color is None:
+            color = "direction"
+    elif tract_colors == "random":
+        color = next(colormap)
+    elif tract_colors == "direction" or len(tract_colors) in [3, 4]:
+        color = tract_colors
+    else:
+        raise ValueError(
+            "Invalid tract_colors value. Must be 'random', 'direction', "
+            "or a tuple of 3 or 4 values."
+        )
 
     return Streamline3D(
         filename,
@@ -446,8 +479,10 @@ class Streamline3D(Visualization):
         Tractogram whose streamlines are rendered.
     line_type : str, optional
         The type of line to render ("Line" or "Tube").
-    color : tuple(float, float, float), optional
-        RGB color of the streamlines in ``[0, 1]``.
+    color : tuple of float, str, or ndarray, optional
+        RGB(A) color of the streamlines in ``[0, 1]``, ``"direction"`` for
+        directional coloring, or an ``(n_points, 3)`` array of per-point RGB
+        colors in ``[0, 1]``.
     render_callback : callable, optional
         Callback used to request a render/update.
     switch_render_callback : callable, optional
@@ -480,8 +515,10 @@ class Streamline3D(Visualization):
             Tractogram whose streamlines are rendered.
         line_type : str, optional
             The type of line to render ("Line" or "Tube").
-        color : tuple(float, float, float), optional
-            RGB color of the streamlines in ``[0, 1]``.
+        color : tuple of float, str, or ndarray, optional
+            RGB(A) color of the streamlines in ``[0, 1]``, ``"direction"`` for
+            directional coloring, or an ``(n_points, 3)`` array of per-point
+            RGB colors in ``[0, 1]``.
         render_callback : callable, optional
             Callback used to request a render/update.
         switch_render_callback : callable, optional

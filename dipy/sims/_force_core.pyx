@@ -144,6 +144,27 @@ cdef inline double sample_gm_d_iso() noexcept:
     """Sample gray matter isotropic diffusivity."""
     return _sample_uniform_or_fixed(GM_D_MIN, GM_D_MAX)
 
+cdef tuple _fiber_mevals(cnp.ndarray[DTYPE_t, ndim=2] target_sphere, double d_par,
+                         double d_perp_extra):
+    """Extra- and intra-axonal eigenvalues of one fiber, for every direction."""
+    mevals_ex = np.zeros_like(target_sphere, dtype=np.float64)
+    mevals_ex[:, 0] = d_par
+    mevals_ex[:, 1] = d_perp_extra
+    mevals_ex[:, 2] = d_perp_extra
+    mevals_in = np.zeros_like(target_sphere, dtype=np.float64)
+    mevals_in[:, 0] = d_par
+    return mevals_ex, mevals_in
+
+
+cdef double _weighted(object fractions, object values):
+    """Fraction-weighted mean of per-fiber values (fractions sum to one)."""
+    cdef double total = 0.0
+    cdef Py_ssize_t k
+    for k in range(len(values)):
+        total += float(fractions[k]) * float(values[k])
+    return total
+
+
 
 cdef Py_ssize_t _closest_direction(
     cnp.ndarray[DTYPE_t, ndim=2] target_sphere,
@@ -261,7 +282,9 @@ cpdef tuple generate_single_fiber(
     -------
     tuple
         (signal, labels, num_fibers, dispersion, placeholder,
-         neurite_density, odf, d_par, d_perp, fractions, f_ins)
+         neurite_density, odf, d_par, d_perp, fractions, f_ins,
+         fiber_indices, d_perp_extra, fiber_d_par, fiber_d_perp_extra,
+         fiber_dispersion)
     """
     cdef:
         Py_ssize_t n_dirs = target_sphere.shape[0]
@@ -318,6 +341,11 @@ cpdef tuple generate_single_fiber(
         f_extra * d_perp_extra,
         [1.0, 0.0, 0.0],
         [f_intra],
+        [idx],
+        d_perp_extra,
+        [d_par],
+        [d_perp_extra],
+        [factor],
     )
 
 
@@ -359,12 +387,16 @@ cpdef tuple generate_two_fibers(
     Returns
     -------
     tuple
-        Signal and associated parameters.
+        Signal and associated parameters. Entries 11 and 12 are the sphere
+        index of each fiber, in the order of the fractions, and the
+        fraction-weighted extra-axonal perpendicular diffusivity; entries 13,
+        14 and 15 are the axial diffusivity, extra-axonal perpendicular
+        diffusivity and dispersion of each fiber. The scalar diffusivities and
+        dispersion (entries 3, 7, 8) are fraction-weighted over the fibers.
     """
     cdef:
         Py_ssize_t n_dirs = target_sphere.shape[0]
         double S0 = 100.0
-        double d_par, d_perp_extra
         double fiber_frac1
         double wm_nd, wm_d_perp
         int i
@@ -374,23 +406,15 @@ cpdef tuple generate_two_fibers(
     fiber_frac1 = float(np.random.uniform(0.2, 0.8))
     fiber_fractions = [fiber_frac1, 1.0 - fiber_frac1]
 
-    d_par = sample_wm_d_par()
+    # Each fiber population has its own diffusivities and dispersion.
+    d_pars = [sample_wm_d_par() for i in range(2)]
     if tortuosity:
-        d_perp_extra = get_dperp_extra(d_par, float(f_in[0]))
+        d_perp_extras = [get_dperp_extra(d_pars[i], float(f_in[i])) for i in range(2)]
     else:
-        d_perp_extra = sample_wm_d_perp()
+        d_perp_extras = [sample_wm_d_perp() for i in range(2)]
+    factors = [float(np.random.choice(odi_list)) for i in range(2)]
 
     labels = np.zeros(n_dirs, dtype=np.uint8)
-
-    mevals_ex = np.zeros_like(target_sphere, dtype=np.float64)
-    mevals_ex[:, 0] = d_par
-    mevals_ex[:, 1] = d_perp_extra
-    mevals_ex[:, 2] = d_perp_extra
-
-    mevals_in = np.zeros_like(target_sphere, dtype=np.float64)
-    mevals_in[:, 0] = d_par
-    mevals_in[:, 1] = 0.0
-    mevals_in[:, 2] = 0.0
 
     _MAX_ANGLE_TRIES = 10000
     index = np.random.randint(0, n_dirs, 2)
@@ -414,13 +438,12 @@ cpdef tuple generate_two_fibers(
     true_stick1 = target_sphere[idx0]
     true_stick2 = target_sphere[idx1]
 
-    factor = float(np.random.choice(odi_list))
-
     S = np.zeros(bvals.shape[0], dtype=np.float64)
     fodf = np.zeros(n_dirs, dtype=np.float64)
 
     for i in range(2):
-        fodf_gt = bingham_sf[int(index[i])][factor]
+        mevals_ex, mevals_in = _fiber_mevals(target_sphere, d_pars[i], d_perp_extras[i])
+        fodf_gt = bingham_sf[int(index[i])][factors[i]]
         fodf_gt = np.ascontiguousarray(fodf_gt, dtype=np.float64)
         fodf_gt = fodf_gt / np.sum(fodf_gt)
 
@@ -439,22 +462,27 @@ cpdef tuple generate_two_fibers(
 
     wm_nd = fiber_fractions[0] * float(f_in[0]) + fiber_fractions[1] * float(f_in[1])
     wm_d_perp = (
-        fiber_fractions[0] * (1.0 - float(f_in[0])) * d_perp_extra
-        + fiber_fractions[1] * (1.0 - float(f_in[1])) * d_perp_extra
+        fiber_fractions[0] * (1.0 - float(f_in[0])) * d_perp_extras[0]
+        + fiber_fractions[1] * (1.0 - float(f_in[1])) * d_perp_extras[1]
     )
 
     return (
         S * S0,
         labels,
         2,
-        factor,
+        _weighted(fiber_fractions, factors),
         0.0,
         wm_nd,
         fodf,
-        d_par,
+        _weighted(fiber_fractions, d_pars),
         wm_d_perp,
         [fiber_frac1, 1.0 - fiber_frac1, 0.0],
         f_in.tolist(),
+        [idx0, idx1],
+        _weighted(fiber_fractions, d_perp_extras),
+        d_pars,
+        d_perp_extras,
+        factors,
     )
 
 
@@ -496,12 +524,14 @@ cpdef tuple generate_three_fibers(
     Returns
     -------
     tuple
-        Signal and associated parameters.
+        Signal and associated parameters, laid out as for
+        :func:`generate_two_fibers`: per-fiber sphere indices, fraction-weighted
+        extra-axonal perpendicular diffusivity, then the axial diffusivity,
+        extra-axonal perpendicular diffusivity and dispersion of each fiber.
     """
     cdef:
         Py_ssize_t n_dirs = target_sphere.shape[0]
         double S0 = 100.0
-        double d_par, d_perp_extra
         double wm_nd = 0.0
         double wm_d_perp = 0.0
         int k
@@ -512,23 +542,15 @@ cpdef tuple generate_three_fibers(
     while np.any(fiber_fracs < 0.2):
         fiber_fracs = np.random.dirichlet([1.0, 1.0, 1.0]).astype(np.float64)
 
-    d_par = sample_wm_d_par()
+    # Each fiber population has its own diffusivities and dispersion.
+    d_pars = [sample_wm_d_par() for k in range(3)]
     if tortuosity:
-        d_perp_extra = get_dperp_extra(d_par, float(f_in[0]))
+        d_perp_extras = [get_dperp_extra(d_pars[k], float(f_in[k])) for k in range(3)]
     else:
-        d_perp_extra = sample_wm_d_perp()
+        d_perp_extras = [sample_wm_d_perp() for k in range(3)]
+    factors = [float(np.random.choice(odi_list)) for k in range(3)]
 
     labels = np.zeros(n_dirs, dtype=np.uint8)
-
-    mevals_ex = np.zeros_like(target_sphere, dtype=np.float64)
-    mevals_ex[:, 0] = d_par
-    mevals_ex[:, 1] = d_perp_extra
-    mevals_ex[:, 2] = d_perp_extra
-
-    mevals_in = np.zeros_like(target_sphere, dtype=np.float64)
-    mevals_in[:, 0] = d_par
-    mevals_in[:, 1] = 0.0
-    mevals_in[:, 2] = 0.0
 
     _MAX_ANGLE_TRIES = 10000
     index = np.random.randint(0, n_dirs, 3)
@@ -565,13 +587,12 @@ cpdef tuple generate_three_fibers(
     true_stick2 = target_sphere[idx1]
     true_stick3 = target_sphere[idx2]
 
-    factor = float(np.random.choice(odi_list))
-
     fodf = np.zeros(n_dirs, dtype=np.float64)
     S = np.zeros(bvals.shape[0], dtype=np.float64)
 
     for k in range(3):
-        fodf_gt = bingham_sf[int(index[k])][factor]
+        mevals_ex, mevals_in = _fiber_mevals(target_sphere, d_pars[k], d_perp_extras[k])
+        fodf_gt = bingham_sf[int(index[k])][factors[k]]
         fodf_gt = np.ascontiguousarray(fodf_gt, dtype=np.float64)
         fodf_gt = fodf_gt / np.sum(fodf_gt)
 
@@ -588,20 +609,26 @@ cpdef tuple generate_three_fibers(
 
     for k in range(3):
         wm_nd += fiber_fracs[k] * float(f_in[k])
-        wm_d_perp += fiber_fracs[k] * (1.0 - float(f_in[k])) * d_perp_extra
+        wm_d_perp += fiber_fracs[k] * (1.0 - float(f_in[k])) * d_perp_extras[k]
 
+    fracs = fiber_fracs.tolist()
     return (
         S * S0,
         labels,
         3,
-        factor,
+        _weighted(fracs, factors),
         0.0,
         wm_nd,
         fodf,
-        d_par,
+        _weighted(fracs, d_pars),
         wm_d_perp,
-        fiber_fracs.tolist(),
+        fracs,
         f_in.tolist(),
+        [idx0, idx1, idx2],
+        _weighted(fracs, d_perp_extras),
+        d_pars,
+        d_perp_extras,
+        factors,
     )
 
 
@@ -804,7 +831,17 @@ cpdef tuple create_mixed_signal(
         (signal, labels, num_fibers, dispersion, wm_fraction,
          gm_fraction, csf_fraction, neurite_density, odf,
          ufa_wm, ufa_voxel, fiber_fractions, wm_disp,
-         wm_d_par, wm_d_perp, gm_d_par, csf_d_par, f_ins)
+         wm_d_par, wm_d_perp, gm_d_par, csf_d_par, f_ins,
+         fiber_indices, wm_d_perp_extra, fiber_d_par, fiber_d_perp_extra,
+         fiber_dispersion)
+
+        ``fiber_indices`` holds the sphere index of each fiber, aligned with
+        ``fiber_fractions`` and ``f_ins``, and -1 for absent fibers. Like
+        ``labels``, it is emptied when the WM fraction is below
+        ``wm_threshold``. ``fiber_d_par``, ``fiber_d_perp_extra`` and
+        ``fiber_dispersion`` (length 3, zero for absent fibers) hold the
+        parameters of each fiber; ``wm_disp``, ``wm_d_par`` and
+        ``wm_d_perp_extra`` are their fraction-weighted means.
     """
     cdef:
         Py_ssize_t n_dirs = target_sphere.shape[0]
@@ -848,6 +885,14 @@ cpdef tuple create_mixed_signal(
     wm_d_perp = wm_result[8]
     fracs = wm_result[9]
     f_ins = wm_result[10]
+    fiber_idx_arr = np.full(3, -1, dtype=np.int16)
+    fiber_idx_arr[:len(wm_result[11])] = wm_result[11]
+    wm_d_perp_extra = wm_result[12]
+    fiber_params = np.zeros((3, 3), dtype=np.float32)
+    for k in range(len(wm_result[13])):
+        fiber_params[0, k] = float(wm_result[13][k])
+        fiber_params[1, k] = float(wm_result[14][k])
+        fiber_params[2, k] = float(wm_result[15][k])
 
     gm_result = create_gm_signal(bvals, target_sphere)
     gm_signal = gm_result[0]
@@ -879,6 +924,7 @@ cpdef tuple create_mixed_signal(
         combined_odf = 50.0 * wm_fraction * wm_odf
     else:
         wm_label = np.zeros(n_dirs, dtype=np.uint8)
+        fiber_idx_arr[:] = -1
         combined_odf = np.zeros(n_dirs, dtype=np.float16)
 
     for k in range(wm_num_fib):
@@ -917,4 +963,9 @@ cpdef tuple create_mixed_signal(
         float(gm_d_par),
         float(csf_d_par),
         f_ins_arr,
+        fiber_idx_arr,
+        float(wm_d_perp_extra),
+        fiber_params[0],
+        fiber_params[1],
+        fiber_params[2],
     )

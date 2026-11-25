@@ -91,6 +91,9 @@ class SkylineFlow(Workflow):
             String options are 'random' for random colors for each tractogram,
             'direction'  for directionally colored streamlines.
             For example, a value of (1, 0, 0) would mean the red color.
+            If not given, tractograms storing per-point colors in
+            ``data_per_point["color"]`` (e.g. written by scilpy, values in
+            [0-255]) are rendered with them; otherwise 'direction' is used.
         cluster_thr : float, optional
             Distance threshold used for clustering. Default value 15.0 for
             small animal brains you may need to use something smaller such

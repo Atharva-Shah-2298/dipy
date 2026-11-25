@@ -14,6 +14,7 @@ from dipy.reconst.shm import descoteaux07_legacy_msg, sph_harm_ind_list
 from dipy.sims.voxel import multi_tensor
 from dipy.utils.optpkg import optional_package
 from dipy.workflows.reconst import (
+    ReconstCSDFlow,
     ReconstForceFlow,
     ReconstForecastFlow,
     ReconstGQIFlow,
@@ -386,6 +387,69 @@ def test_reconst_powermap_edge_cases(tmp_path):
         )
 
 
+def test_reconst_csd_extract_afd(tmp_path):
+    """AFD lobe directions share the frame and order of the pam peaks."""
+    _, bval_path, bvec_path = get_fnames(name="small_64D")
+    bvals, bvecs = read_bvals_bvecs(bval_path, bvec_path)
+    gtab = gradient_table(bvals, bvecs=bvecs)
+    mevals = np.array([[0.0015, 0.0004, 0.0004]] * 2)
+    # Voxels [0] hold one oblique fiber, voxels [1] a 90 degree crossing.
+    volume = np.zeros((2, 2, 2, len(bvals)))
+    volume[0] = multi_tensor(
+        gtab, mevals, S0=100, angles=[(60, 30), (60, 30)], fractions=[50, 50]
+    )[0]
+    volume[1] = multi_tensor(
+        gtab, mevals, S0=100, angles=[(60, 30), (90, 120)], fractions=[60, 40]
+    )[0]
+    # A rotated affine: no world rotation may be applied to either output.
+    affine = np.diag([-2.0, 2.0, 2.0, 1.0])[[1, 0, 2, 3]]
+    data_path = tmp_path / "dwi.nii.gz"
+    mask_path = tmp_path / "mask.nii.gz"
+    save_nifti(data_path, volume, affine)
+    save_nifti(mask_path, np.ones(volume.shape[:3], dtype=np.uint8), affine)
+
+    flow = ReconstCSDFlow()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=descoteaux07_legacy_msg,
+            category=PendingDeprecationWarning,
+        )
+        flow.run(
+            str(data_path),
+            str(bval_path),
+            str(bvec_path),
+            str(mask_path),
+            frf=[15, 4, 4],
+            extract_afd=True,
+            out_dir=str(tmp_path),
+        )
+
+    outputs = flow.last_generated_outputs
+    pam = load_pam(outputs["out_pam"])
+    afd, afd_affine = load_nifti(outputs["out_afd"])
+    afd_dirs = load_nifti_data(outputs["out_afd_dirs"])
+    npt.assert_equal(afd.shape, (*volume.shape[:3], 5))
+    npt.assert_equal(afd_dirs.shape, (*volume.shape[:3], 5, 3))
+    npt.assert_array_equal(afd_affine, affine)
+
+    assert np.all(afd[..., 0] > 0)
+    # Lobes and directions fill the same slots
+    npt.assert_array_equal(afd > 0, np.any(afd_dirs != 0, axis=-1))
+    # Single fiber: one dominant lobe (CSD ringing leaves tiny ones), along the
+    # first pam peak.
+    assert np.all(afd[0, ..., 1:] < 1e-3 * afd[0, ..., :1])
+    pam_dirs = pam.peak_dirs[0, ..., 0, :]
+    pam_dirs = pam_dirs / np.linalg.norm(pam_dirs, axis=-1, keepdims=True)
+    cos = np.abs(np.sum(afd_dirs[0, ..., 0, :] * pam_dirs, axis=-1))
+    npt.assert_array_less(np.cos(np.deg2rad(10)), cos)
+    # Crossing: the larger lobe comes first and follows the first pam peak.
+    assert np.all(afd[1, ..., 0] > afd[1, ..., 1])
+    assert np.all(afd[1, ..., 1] > 0)
+    cos = np.abs(np.sum(afd_dirs[1, ..., 0, :] * pam.peak_dirs[1, ..., 0, :], -1))
+    npt.assert_array_less(np.cos(np.deg2rad(10)), cos)
+
+
 # ---------------------------------------------------------------------------
 # FORCE workflow tests
 # ---------------------------------------------------------------------------
@@ -493,6 +557,86 @@ def test_reconst_force_basic(monkeypatch, tmp_path):
         data_arr = load_nifti_data(out_path)
         npt.assert_equal(data_arr.shape, volume.shape[:3])
         assert np.isfinite(data_arr).all(), f"Non-finite values in {metric}"
+
+
+@pytest.mark.parametrize("use_exact", [False, True])
+def test_reconst_force_peak_maps(use_exact, monkeypatch, tmp_path):
+    """Per-peak maps are saved in the slot order of the pam5 peaks."""
+    data_path, bval_path, bvec_path = get_fnames(name="small_64D")
+    volume, affine = load_nifti(data_path)
+    mask = np.zeros(volume.shape[:3], dtype=np.uint8)
+    mask[:, :, : volume.shape[2] // 2] = 1
+    mask_path = tmp_path / "mask.nii.gz"
+    save_nifti(mask_path, mask, affine)
+
+    bvals, _ = read_bvals_bvecs(bval_path, bvec_path)
+    n_sims = 100
+    sims = _make_fake_simulations(len(bvals), n_sims=n_sims)
+    # Per-fiber metadata: 1 to 3 fibers on distinct sphere vertices.
+    rng = np.random.default_rng(7)
+    n_fibers = rng.integers(1, 4, n_sims)
+    fiber_indices = np.full((n_sims, 3), -1, dtype=np.int32)
+    for i, n in enumerate(n_fibers):
+        fiber_indices[i, :n] = rng.choice(len(default_sphere.vertices), n, False)
+    sims.update(
+        {
+            "fiber_indices": fiber_indices,
+            "f_ins": rng.random((n_sims, 3)).astype(np.float32),
+            "wm_d_par": rng.random(n_sims).astype(np.float32) * 3e-3,
+            "wm_d_perp_extra": rng.random(n_sims).astype(np.float32) * 1e-3,
+            "wm_disp": rng.random(n_sims).astype(np.float32) * 0.3,
+            "fiber_d_par": rng.random((n_sims, 3)).astype(np.float32) * 3e-3,
+            "fiber_d_perp_extra": rng.random((n_sims, 3)).astype(np.float32) * 1e-3,
+            "fiber_disp": rng.random((n_sims, 3)).astype(np.float32) * 0.3,
+        }
+    )
+    _patch_generate(monkeypatch, sims)
+
+    flow = ReconstForceFlow()
+    flow.run(
+        str(data_path),
+        str(bval_path),
+        str(bvec_path),
+        str(mask_path),
+        n_neighbors=5,
+        use_exact=use_exact,
+        engine="serial",
+        out_dir=str(tmp_path),
+    )
+
+    outputs = flow.last_generated_outputs
+    pam = load_pam(outputs["out_pam"])
+    dirs, dirs_affine = load_nifti(outputs["out_peak_dirs"])
+    npt.assert_equal(dirs.shape, (*volume.shape[:3], 5, 3))
+    npt.assert_array_equal(dirs_affine, affine)
+    npt.assert_array_equal(dirs, pam.peak_dirs)
+    assert np.any(dirs[mask.astype(bool)])
+    npt.assert_array_equal(dirs[~mask.astype(bool)], 0)
+
+    fraction = load_nifti_data(outputs["out_peak_fiber_fraction"])
+    npt.assert_array_equal(fraction, pam.peak_values)
+    # A slot holds a value exactly where it holds a direction.
+    npt.assert_array_equal(fraction > 0, np.any(dirs != 0, axis=-1))
+    for name in (
+        "fiber_density",
+        "neurite_density",
+        "axonal_diffusivity",
+        "extra_axonal_diffusivity",
+        "odi",
+    ):
+        peak_map = load_nifti_data(outputs[f"out_peak_{name}"])
+        npt.assert_equal(peak_map.shape, (*volume.shape[:3], 5))
+        assert peak_map.dtype == np.float32
+        npt.assert_array_equal(peak_map[np.all(dirs == 0, axis=-1)], 0)
+
+    # Posterior fixels also report their support.
+    if use_exact:
+        assert not outputs["out_peak_support"].exists()
+    else:
+        support = load_nifti_data(outputs["out_peak_support"])
+        npt.assert_equal(support.shape, (*volume.shape[:3], 5))
+        assert np.all((support >= 0) & (support <= 1 + 1e-6))
+        npt.assert_array_equal(support > 0, fraction > 0)
 
 
 def test_reconst_force_select_metrics(monkeypatch, tmp_path):

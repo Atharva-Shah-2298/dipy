@@ -16,11 +16,13 @@ from dipy.reconst.force import (
     DEFAULT_FORCE_SEED,
     DEFAULT_NUM_ODI_VALUES,
     DEFAULT_ODI_RANGE,
+    PEAK_METRICS,
     FORCEFit,
     FORCEModel,
     SignalIndex,
     _fwhm_kde_batch,
     _odi_grid_matches,
+    _posterior_peak_params,
     _seed_matches,
     _weighted_percentile,
     compute_microstructure_uncertainty_ambiguity,
@@ -145,6 +147,356 @@ def test_force_peaks_single_voxel():
     npt.assert_array_equal(pam.peak_indices, expected_inds)
     npt.assert_array_equal(pam.peak_values, expected_vals)
     npt.assert_allclose(pam.shm_coeff, expected_sh, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("use_posterior", [False, True])
+def test_force_peak_metrics_describe_the_matched_fibers(
+    use_posterior, tmp_path, monkeypatch
+):
+    """Best-match per-peak maps and force_peaks describe its fibers in order."""
+    monkeypatch.setenv("DIPY_HOME", str(tmp_path))
+    gtab = _make_gtab([1000, 2000])
+    model = FORCEModel(
+        gtab,
+        penalty=0,
+        n_neighbors=8,
+        use_posterior=use_posterior,
+        peak_source="best_match",
+    )
+    model.generate(num_simulations=400, num_cpus=1, verbose=False)
+    sims = model.simulations
+    # Matching a library entry against itself returns that entry.
+    query = np.flatnonzero((sims["fiber_indices"] >= 0).sum(axis=1) >= 2)[:20]
+    query = np.concatenate([query, np.flatnonzero(sims["fiber_indices"][:, 0] < 0)[:5]])
+    fit = model.fit(sims["signals"][query])
+
+    dirs, inds = fit.peak_dirs, fit.peak_indices
+    assert dirs.shape == (query.size, 5, 3)
+    for name in (
+        "fiber_fraction",
+        "fiber_density",
+        "neurite_density",
+        "axonal_diffusivity",
+        "extra_axonal_diffusivity",
+        "odi",
+    ):
+        assert getattr(fit, f"peak_{name}").shape == (query.size, 5)
+
+    for row, sim in enumerate(query):
+        present = sims["fiber_indices"][sim] >= 0
+        n_peaks = present.sum()
+        fractions = sims["fraction_array"][sim][present]
+        intra = sims["f_ins"][sim][present]
+        order = np.argsort(-fractions, kind="stable")
+        expected_inds = sims["fiber_indices"][sim][present][order]
+
+        npt.assert_array_equal(inds[row, :n_peaks], expected_inds)
+        npt.assert_array_equal(inds[row, n_peaks:], -1)
+        npt.assert_allclose(dirs[row, :n_peaks], default_sphere.vertices[expected_inds])
+        npt.assert_array_equal(dirs[row, n_peaks:], 0)
+        npt.assert_allclose(fit.peak_fiber_fraction[row, :n_peaks], fractions[order])
+        npt.assert_allclose(fit.peak_neurite_density[row, :n_peaks], intra[order])
+        npt.assert_allclose(
+            fit.peak_fiber_density[row, :n_peaks],
+            sims["wm_fraction"][sim] * fractions[order] * intra[order],
+            rtol=1e-6,
+        )
+        # Every fiber has its own diffusivities and dispersion.
+        for name, key in (
+            ("axonal_diffusivity", "fiber_d_par"),
+            ("extra_axonal_diffusivity", "fiber_d_perp_extra"),
+            ("odi", "fiber_disp"),
+        ):
+            values = getattr(fit, f"peak_{name}")[row]
+            npt.assert_allclose(values[:n_peaks], sims[key][sim][present][order])
+            npt.assert_array_equal(values[n_peaks:], 0)
+        npt.assert_array_equal(fit.peak_fiber_fraction[row, n_peaks:], 0)
+
+    # force_peaks shares the slot order: peak k's value is fiber k's fraction.
+    pam = force_peaks(fit)
+    npt.assert_array_equal(pam.peak_dirs, dirs)
+    npt.assert_array_equal(pam.peak_indices, inds)
+    npt.assert_array_equal(pam.peak_values, fit.peak_fiber_fraction)
+    single = force_peaks(fit[0])
+    npt.assert_array_equal(single.peak_dirs, dirs[0])
+    npt.assert_array_equal(single.peak_values, fit.peak_fiber_fraction[0])
+
+
+def _fixel_library():
+    """Hand-made library whose neighbors list fibers x and y in either order."""
+    v = default_sphere.vertices
+    x = 0
+    y = int(np.argmin(np.abs(v @ v[x])))
+    z = int(np.argmax(np.abs(v @ np.cross(v[x], v[y]))))
+    # A fiber about 20 degrees away from x.
+    near_x = int(np.argmin(np.abs(np.degrees(np.arccos(np.abs(v @ v[x]))) - 20)))
+    d = {
+        "fiber_indices": np.array(
+            [[x, y, -1], [y, x, -1], [x, -1, -1], [z, -1, -1], [near_x, -1, -1]],
+            dtype=np.int16,
+        ),
+        "fraction_array": np.array(
+            [[0.6, 0.4, 0], [0.7, 0.3, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0]]
+        ),
+        "f_ins": np.array(
+            [[0.7, 0.5, 0], [0.6, 0.8, 0], [0.4, 0, 0], [0.9, 0, 0], [0.3, 0, 0]]
+        ),
+        "wm_fraction": np.array([0.8, 0.6, 0.9, 0.5, 0.7]),
+        "wm_d_par": np.array([2.0e-3, 2.5e-3, 3.0e-3, 2.2e-3, 2.4e-3]),
+        "wm_d_perp_extra": np.array([5e-4, 7e-4, 9e-4, 6e-4, 8e-4]),
+        "wm_disp": np.array([0.05, 0.1, 0.2, 0.15, 0.25]),
+        "fiber_d_par": np.array(
+            [
+                [2.0e-3, 2.9e-3, 0],
+                [2.5e-3, 2.1e-3, 0],
+                [3.0e-3, 0, 0],
+                [2.2e-3, 0, 0],
+                [2.4e-3, 0, 0],
+            ]
+        ),
+        "fiber_d_perp_extra": np.array(
+            [
+                [5e-4, 1.1e-3, 0],
+                [7e-4, 4e-4, 0],
+                [9e-4, 0, 0],
+                [6e-4, 0, 0],
+                [8e-4, 0, 0],
+            ]
+        ),
+        "fiber_disp": np.array(
+            [[0.05, 0.2, 0], [0.1, 0.03, 0], [0.2, 0, 0], [0.15, 0, 0], [0.25, 0, 0]]
+        ),
+    }
+    return d, (x, y, z, near_x)
+
+
+def _expected_fixel(d, neighbors, W, members):
+    """Hand-computed posterior fixel parameters from (neighbor, slot) pairs."""
+    w = np.array([W[k] * d["fraction_array"][neighbors[k], j] for k, j in members])
+    sims = [neighbors[k] for k, _ in members]
+    slots = [j for _, j in members]
+    intra = d["f_ins"][sims, slots]
+    expected = {"fiber_fraction": w.sum()}
+    for name, x in (
+        ("neurite_density", intra),
+        ("axonal_diffusivity", d["fiber_d_par"][sims, slots]),
+        ("extra_axonal_diffusivity", d["fiber_d_perp_extra"][sims, slots]),
+        ("odi", d["fiber_disp"][sims, slots]),
+    ):
+        mean = np.sum(w * x) / w.sum()
+        expected[name] = mean
+        expected[f"{name}_std"] = np.sqrt(np.sum(w * (x - mean) ** 2) / w.sum())
+    per_neighbor = np.zeros(len(W))
+    for k, j in members:
+        s = neighbors[k]
+        per_neighbor[k] += (
+            d["wm_fraction"][s] * d["fraction_array"][s, j] * d["f_ins"][s, j]
+        )
+    fd = np.sum(W * per_neighbor)
+    expected["fiber_density"] = fd
+    expected["fiber_density_std"] = np.sqrt(np.sum(W * (per_neighbor - fd) ** 2))
+    expected["support"] = sum(W[k] for k in {k for k, _ in members})
+    return expected
+
+
+def test_posterior_fixels_pool_neighbor_fibers():
+    """Fixels pool neighbor fibers regardless of their slot order."""
+    d, (x, y, z, _) = _fixel_library()
+    v = default_sphere.vertices
+    neighbors = np.array([[0, 1, 2, 3], [0, 1, 2, 3]])
+    # The second voxel weighs fiber z enough to form its own fixel.
+    W = np.array([[0.5, 0.28, 0.2, 0.02], [0.1, 0.7, 0.1, 0.1]])
+    params = _posterior_peak_params(neighbors, W, d, peak_source="fibers")
+
+    expected_fixels = (
+        ((x, [(0, 0), (1, 1), (2, 0)]), (y, [(0, 1), (1, 0)])),
+        ((y, [(0, 1), (1, 0)]), (x, [(0, 0), (1, 1), (2, 0)]), (z, [(3, 0)])),
+    )
+    for row, fixels in enumerate(expected_fixels):
+        n = len(fixels)
+        npt.assert_array_equal(params["peak_indices"][row, :n], [f[0] for f in fixels])
+        npt.assert_array_equal(params["peak_indices"][row, n:], -1)
+        npt.assert_array_equal(params["peak_dirs"][row, n:], 0)
+        for p, (vertex, members) in enumerate(fixels):
+            cos = np.abs(params["peak_dirs"][row, p] @ v[vertex])
+            assert cos > np.cos(np.deg2rad(1))
+            # Directions keep the orientation of their sphere vertex.
+            assert params["peak_dirs"][row, p] @ v[vertex] > 0
+            expected = _expected_fixel(d, neighbors[row], W[row], members)
+            for name, value in expected.items():
+                npt.assert_allclose(
+                    params[f"peak_{name}"][row, p], value, rtol=1e-5, atol=1e-9
+                )
+        for name in (*expected, "fiber_fraction"):
+            npt.assert_array_equal(params[f"peak_{name}"][row, n:], 0)
+
+
+def test_posterior_fixels_assign_angle():
+    """Fibers beyond ``assign_angle`` from every fixel join no fixel."""
+    d, (x, _, _, near_x) = _fixel_library()
+    neighbors = np.array([[2, 4]])
+    W = np.array([[0.97, 0.03]])
+    # The fiber 20 degrees off x is too light for a fixel of its own.
+    absorbed = _posterior_peak_params(neighbors, W, d, peak_source="fibers")
+    npt.assert_array_equal(absorbed["peak_indices"][0], [x, -1, -1, -1, -1])
+    npt.assert_allclose(absorbed["peak_fiber_fraction"][0, 0], 1.0, rtol=1e-6)
+    npt.assert_allclose(absorbed["peak_support"][0, 0], 1.0, rtol=1e-6)
+
+    excluded = _posterior_peak_params(
+        neighbors, W, d, peak_source="fibers", assign_angle=10
+    )
+    npt.assert_array_equal(excluded["peak_indices"][0], [x, -1, -1, -1, -1])
+    npt.assert_allclose(excluded["peak_fiber_fraction"][0, 0], 0.97, rtol=1e-6)
+    npt.assert_allclose(excluded["peak_support"][0, 0], 0.97, rtol=1e-6)
+    npt.assert_allclose(excluded["peak_neurite_density"][0, 0], 0.4, rtol=1e-6)
+    npt.assert_allclose(excluded["peak_neurite_density_std"][0, 0], 0, atol=1e-7)
+
+
+def test_posterior_fixels_hybrid_keeps_best_match_layout():
+    """Hybrid fixels are the best match's fibers with pooled metrics."""
+    d, (x, y, z, _) = _fixel_library()
+    v = default_sphere.vertices
+    neighbors = np.array([[0, 1, 2, 3]])
+    W = np.array([[0.5, 0.28, 0.2, 0.02]])
+    # The best match (library entry 1) lists y (0.7) before x (0.3).
+    params = _posterior_peak_params(
+        neighbors, W, d, peak_source="hybrid", lib_idx=np.array([1])
+    )
+
+    npt.assert_array_equal(params["peak_indices"][0], [y, x, -1, -1, -1])
+    npt.assert_allclose(params["peak_fiber_fraction"][0], [0.7, 0.3, 0, 0, 0])
+    # Fiber z, far from both best-match fibers, joins neither fixel.
+    pooled = 1 - W[0, 3]
+    for p, (vertex, members) in enumerate(
+        ((y, [(0, 1), (1, 0)]), (x, [(0, 0), (1, 1), (2, 0)]))
+    ):
+        assert abs(params["peak_dirs"][0, p] @ v[vertex]) > np.cos(np.deg2rad(1))
+        expected = _expected_fixel(d, neighbors[0], W[0], members)
+        for name in (
+            "neurite_density",
+            "axonal_diffusivity",
+            "extra_axonal_diffusivity",
+            "odi",
+            "neurite_density_std",
+            "support",
+        ):
+            npt.assert_allclose(params[f"peak_{name}"][0, p], expected[name], rtol=1e-5)
+        npt.assert_allclose(
+            params["peak_fiber_density"][0, p],
+            expected["fiber_density"] / pooled,
+            rtol=1e-5,
+        )
+    # A best match without fibers gives no fixels, whatever the neighbors say.
+    d["fiber_indices"][3] = -1
+    empty = _posterior_peak_params(
+        neighbors, W, d, peak_source="hybrid", lib_idx=np.array([3])
+    )
+    npt.assert_array_equal(empty["peak_indices"][0], -1)
+
+
+def test_force_peak_source_validation():
+    """Unknown peak sources are rejected."""
+    with pytest.raises(ValueError, match="peak_source"):
+        FORCEModel(_make_gtab([1000]), peak_source="mean")
+
+
+def test_force_best_match_peak_source_in_posterior_mode(tmp_path, monkeypatch):
+    """``peak_source='best_match'`` reproduces the best-match peaks."""
+    monkeypatch.setenv("DIPY_HOME", str(tmp_path))
+    gtab = _make_gtab([1000, 2000])
+    model = FORCEModel(gtab, n_neighbors=8, peak_source="best_match")
+    model.generate(num_simulations=400, num_cpus=1, verbose=False)
+    sims = model.simulations
+    rng = np.random.default_rng(0)
+    data = sims["signals"][:30] + rng.normal(0, 0.02, (30, sims["signals"].shape[1]))
+    exact = FORCEModel(gtab, simulations=sims, n_neighbors=8, use_posterior=False)
+
+    fit, fit_exact = model.fit(data), exact.fit(data)
+    assert fit[0].entropy is not None
+    for name in ("dirs", "indices", *PEAK_METRICS):
+        npt.assert_array_equal(
+            getattr(fit, f"peak_{name}"), getattr(fit_exact, f"peak_{name}")
+        )
+    assert fit[0].peak_support is None
+    assert fit[0].peak_odi_std is None
+
+
+def test_force_posterior_fixels_fit(tmp_path, monkeypatch):
+    """Posterior fixels from the fiber and ODF densities find the crossings."""
+    from dipy.data import get_sphere
+
+    monkeypatch.setenv("DIPY_HOME", str(tmp_path))
+    dirs = get_sphere(name="repulsion100").vertices[:30]
+    gtab = gradient_table(
+        np.r_[0, 0, [1000] * 30, [2000] * 30].astype(float),
+        bvecs=np.r_[np.zeros((2, 3)), dirs, dirs],
+    )
+    model = FORCEModel(gtab, n_neighbors=8)
+    model.generate(num_simulations=2000, num_cpus=1, verbose=False)
+    sims = model.simulations
+    v = default_sphere.vertices
+
+    # Library crossings of two well-separated, comparable, coherent fibers.
+    idx = sims["fiber_indices"]
+    two = np.flatnonzero((idx[:, 0] >= 0) & (idx[:, 1] >= 0) & (idx[:, 2] < 0))
+    cos = np.abs(np.sum(v[idx[two, 0]] * v[idx[two, 1]], axis=1))
+    query = two[
+        (cos < np.cos(np.deg2rad(60)))
+        & (sims["fraction_array"][two, :2].min(axis=1) > 0.3)
+        & (sims["fiber_disp"][two, :2].max(axis=1) <= 0.1)
+    ]
+    assert query.size >= 5
+    data = sims["signals"][query]
+
+    fit = model.fit(data)
+    model.peak_source = "odf"
+    fit_odf = model.fit(data)
+
+    for f in (fit, fit_odf):
+        assert f.peak_support.shape == (query.size, 5)
+        assert np.all((f.peak_support >= 0) & (f.peak_support <= 1 + 1e-6))
+        assert np.all(f.peak_fiber_fraction.sum(axis=1) <= 1 + 1e-5)
+        for name in PEAK_METRICS[1:]:
+            assert np.all(getattr(f, f"peak_{name}_std") >= 0)
+        # force_peaks reports the posterior fixels.
+        pam = force_peaks(f)
+        npt.assert_array_equal(pam.peak_dirs, f.peak_dirs)
+        npt.assert_array_equal(pam.peak_indices, f.peak_indices)
+        npt.assert_array_equal(pam.peak_values, f.peak_fiber_fraction)
+
+    for row, sim in enumerate(query):
+        truth = v[idx[sim, :2]]
+        for f in (fit, fit_odf):
+            assert np.all(f.peak_indices[row, :2] >= 0)
+            npt.assert_array_equal(f.peak_indices[row, 2:], -1)
+            found = f.peak_dirs[row, :2]
+            angles = np.degrees(np.arccos(np.clip(np.abs(found @ truth.T), 0, 1)))
+            assert np.all(angles.min(axis=1) < 3)
+            assert np.all(angles.min(axis=0) < 3)
+        # Both densities yield the same fixels.
+        between = np.abs(np.sum(fit.peak_dirs[row] * fit_odf.peak_dirs[row], -1))
+        assert np.all(np.degrees(np.arccos(np.clip(between[:2], 0, 1))) < 3)
+
+
+def test_force_peaks_mask_empties_unfitted_and_unmasked_voxels(tmp_path, monkeypatch):
+    """Peak slots outside the fit mask or the peak mask are empty."""
+    monkeypatch.setenv("DIPY_HOME", str(tmp_path))
+    gtab = _make_gtab([1000, 2000])
+    model = FORCEModel(gtab, penalty=0, n_neighbors=8)
+    model.generate(num_simulations=200, num_cpus=1, verbose=False)
+    sims = model.simulations
+    with_fibers = np.flatnonzero(sims["fiber_indices"][:, 0] >= 0)[:4]
+    data = sims["signals"][with_fibers].reshape(2, 2, 1, -1)
+    fit_mask = np.array([[[True], [True]], [[True], [False]]])
+    peak_mask = np.array([[[True], [False]], [[True], [True]]])
+
+    pam = force_peaks(model.fit(data, mask=fit_mask), mask=peak_mask)
+
+    kept = fit_mask & peak_mask
+    assert np.all(pam.peak_indices[kept][:, 0] >= 0)
+    npt.assert_array_equal(pam.peak_indices[~kept], -1)
+    npt.assert_array_equal(pam.peak_values[~kept], 0)
+    npt.assert_array_equal(pam.peak_dirs[~kept], 0)
 
 
 def test_normalize_signals():
@@ -609,3 +961,25 @@ def test_cache_registry_separates_min_crossing_angles(tmp_path, monkeypatch):
     )
     assert len(list(cache_dir.glob("force_sim_*.npz"))) == 2
     npt.assert_array_equal(again.simulations["signals"], relaxed.simulations["signals"])
+
+
+def test_force_cache_skips_libraries_without_fiber_metadata(tmp_path, monkeypatch):
+    """Cached libraries that predate per-fiber metadata are regenerated."""
+    monkeypatch.setenv("DIPY_HOME", str(tmp_path))
+    gtab = _make_gtab([1000])
+    FORCEModel(gtab).generate(num_simulations=60, num_cpus=1, verbose=False)
+
+    registry_path = tmp_path / "force_simulations" / "cache_registry.json"
+    registry = _registry(tmp_path)
+    registry[0].pop("fiber_metadata")
+    with open(registry_path, "w") as f:
+        json.dump(registry, f)
+
+    model = FORCEModel(gtab)
+    model.generate(num_simulations=60, num_cpus=1, verbose=False)
+    assert len(_registry(tmp_path)) == 2
+    assert "fiber_indices" in model.simulations
+
+    # The regenerated library is then reused.
+    FORCEModel(gtab).generate(num_simulations=60, num_cpus=1, verbose=False)
+    assert len(_registry(tmp_path)) == 2

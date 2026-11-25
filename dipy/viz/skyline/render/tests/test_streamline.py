@@ -70,11 +70,21 @@ def _bundle(n_lines=24, n_points=12):
     return lines
 
 
-def _sft(lines=None):
+def _sft(lines=None, *, point_colors=None):
     reference = nib.Nifti1Image(np.zeros(SHAPE, dtype=np.float32), AFFINE)
+    lines = lines if lines is not None else _polylines(6)
+    data_per_point = None
+    if point_colors is not None:
+        splits = np.cumsum([len(line) for line in lines])[:-1]
+        data_per_point = {"color": np.split(point_colors, splits)}
     return StatefulTractogram(
-        lines if lines is not None else _polylines(6), reference, Space.RASMM
+        lines, reference, Space.RASMM, data_per_point=data_per_point
     )
+
+
+def _scilpy_colors(n_points):
+    """Per-point uint8-range colors as written by scilpy."""
+    return np.random.default_rng(5).integers(0, 256, (n_points, 3)).astype(np.float32)
 
 
 @pytest.mark.parametrize("diagonal", [False, True])
@@ -343,6 +353,59 @@ def test_create_streamline_visualization_explicit_color(color):
 def test_create_streamline_visualization_rejects_an_unknown_color_option():
     with pytest.raises(ValueError, match="Invalid tract_colors value"):
         create_streamline_visualization((_sft(), "t.trk"), 0, tract_colors="rainbow")
+
+
+@pytest.mark.parametrize("scale", [1.0, 255.0])
+def test_create_streamline_visualization_uses_stored_point_colors(scale):
+    lines = _polylines(6)
+    expected = _scilpy_colors(len(lines.get_data())) / 255
+    expected[0] = (1.0, 0.0, 1.0)  # Pin the max so [0, 1] input is not rescaled.
+    sft = _sft(lines, point_colors=expected * scale)
+
+    viz = create_streamline_visualization((sft, "t.trx"), 0)
+
+    assert isinstance(viz.color, np.ndarray)
+    assert viz.color.shape == (len(lines.get_data()), 3)
+    npt.assert_allclose(viz.color, expected, rtol=1e-6)
+    actor_colors = viz.actor.geometry.colors.data
+    finite = np.isfinite(viz.actor.geometry.positions.data).all(axis=1)
+    npt.assert_allclose(actor_colors[finite, :3], expected, rtol=1e-6)
+
+
+def test_create_streamline_visualization_tubes_use_stored_point_colors():
+    lines = _polylines(3)
+    colors = _scilpy_colors(len(lines.get_data()))
+    sft = _sft(lines, point_colors=colors)
+
+    viz = create_streamline_visualization((sft, "t.trx"), 0, line_type="Tube")
+
+    expected = create_streamline(
+        lines,
+        color=np.split(colors / 255, np.cumsum([len(line) for line in lines])[:-1]),
+        line_type="Tube",
+    )
+    _assert_same_tube(viz.actor, expected)
+    tube_colors = viz.actor.geometry.colors.data[:, :3]
+    distances = np.abs(tube_colors[:, None, :] - (colors / 255)[None]).max(axis=-1)
+    npt.assert_allclose(distances.min(axis=1), 0, atol=1e-6)
+
+
+@pytest.mark.parametrize("tract_colors", ["direction", (0.2, 0.4, 0.6)])
+def test_create_streamline_visualization_explicit_colors_beat_stored_colors(
+    tract_colors,
+):
+    lines = _polylines(6)
+    sft = _sft(lines, point_colors=_scilpy_colors(len(lines.get_data())))
+
+    viz = create_streamline_visualization((sft, "t.trx"), 0, tract_colors=tract_colors)
+
+    assert viz.color == tract_colors
+
+
+def test_create_streamline_visualization_defaults_to_direction_without_stored():
+    viz = create_streamline_visualization((_sft(), "t.trk"), 0)
+
+    assert viz.color == "direction"
 
 
 def test_create_streamline_visualization_builds_a_cluster_view():
